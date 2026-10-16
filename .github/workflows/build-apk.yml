@@ -264,7 +264,27 @@ jobs:
           }
           if ("${{ inputs.dji_msdk }}" -eq "true") { $gradleArgs += "-Pdji.msdk=true" }
           if ("${{ inputs.dji_app_key }}" -ne "") { $gradleArgs += "-Pdji.appKey=${{ inputs.dji_app_key }}" }
-          & .\gradlew.bat --no-daemon :app:assembleRelease @gradleArgs
+
+          $logFile = "$env:RUNNER_TEMP\gradle.log"
+          & .\gradlew.bat --no-daemon :app:assembleRelease @gradleArgs 2>&1 |
+            Tee-Object -FilePath $logFile
+          if ($LASTEXITCODE -ne 0) {
+            # Report the reason as a check annotation. Reading the Actions log
+            # needs actions:read; an annotation is readable by anyone, so the
+            # failure can be diagnosed without the web UI.
+            $lines  = Get-Content $logFile -ErrorAction SilentlyContinue
+            $picked = $lines | Where-Object {
+              $_ -match '^\s*(FAILURE:|e: |error:|\* What went wrong|Caused by:|> Task .*FAILED|CMake Error|ninja:|ld: |clang(\+\+)?: error|error C[0-9]|BUILD FAILED|Execution failed for task|Could not (resolve|find|determine|download|create|open|load)|No such file|not found|cannot find)' -or
+              $_ -match 'error:' -or
+              $_ -match 'Unresolved reference' -or
+              $_ -match 'What went wrong'
+            } | Select-Object -Last 40
+            if (-not $picked) { $picked = $lines | Select-Object -Last 40 }
+            $msg = (($picked -replace '%', '%25') -join "%0A")
+            Write-Host "::error title=Build APK failed::$msg"
+            exit 1
+          }
+          Get-Item app\build\outputs\apk\release\app-release.apk | Format-List Length,FullName
 
       # The DJI App Key is bound to the package name *and* the signing
       # certificate, so print the fingerprint that developer.dji.com must be
