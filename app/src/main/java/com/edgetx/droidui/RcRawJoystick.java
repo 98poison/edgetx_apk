@@ -167,6 +167,19 @@ final class RcRawJoystick {
     /** Verbose flag, decided once at start. */
     private static volatile boolean sVerbose;
 
+    /** Set at the first failed hand-over, so that failure is reported exactly once. */
+    private static volatile boolean sDeliveryWarned;
+
+    /** Reports a hand-over that failed, once: see the call site for why it is not silent. */
+    private static void warnDelivery(String message, Throwable t) {
+        if (sDeliveryWarned) {
+            return;
+        }
+        sDeliveryWarned = true;
+        Log.w(TAG, "raw joystick: " + message + " - the reports are being read but nothing "
+                + "downstream sees them (further failures are not logged)", t);
+    }
+
     /** Last raw value per axis, so only real changes are pushed. */
     private static final int[] sRawValue = new int[AXIS_COUNT];
     private static final boolean[] sRawSeen = new boolean[AXIS_COUNT];
@@ -483,7 +496,12 @@ final class RcRawJoystick {
                     DjiMsdkBridge.nativeOnDjiDial(index - STICK_COUNT, centred);
                 }
             } catch (Throwable t) {
-                // A missing native side must not kill the reader.
+                // A missing native side must not kill the reader - but it must not be
+                // silent either. This reader used to swallow this and nothing else said a
+                // word, so a broken hand-over looked exactly like "the sticks do not
+                // work": the log showed 398 report(s)/s and every axis reading zero. Say
+                // it once, then keep reading in case the native side comes back.
+                warnDelivery("the axes could not be handed to the firmware", t);
             }
         }
 

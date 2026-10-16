@@ -1389,9 +1389,30 @@ public final class DjiMsdkBridge {
      *
      * <p>The sign is EdgeTX's, not the remote's: the switch is labelled high/middle/low and
      * its high end is EdgeTX's down position, so the top is +1 rather than -1.
+     *
+     * <p>The table is built on first use rather than at class-init, and that is not a style
+     * choice: its element type is a DJI SDK enum, so initialising it here makes the whole
+     * class unloadable in a build that does not carry the SDK - and this class is not only
+     * the SDK's. Every stick, dial, 5-way and button the raw-joystick reader decodes is
+     * handed to the firmware through the native entry points declared above. Measured on the
+     * RC Plus 2 with dji.msdk=false: the class failed to initialise, the reader still
+     * reported 398 report(s)/s and every axis still read zero, because each hand-over threw
+     * NoClassDefFoundError into a catch that said nothing. Nothing reads the table before
+     * the SDK starts delivering the switch, so building it lazily costs nothing.
      */
-    private static final RCFlightModeSwitch[] FLIGHT_MODE_TOP_FIRST = flightModeTopFirst();
+    private static volatile RCFlightModeSwitch[] sFlightModeTopFirst;
+
     private static final int[] POSITION_TOP_FIRST = {1, 0, -1};
+
+    /** The table above, built once on first use (see its comment). */
+    private static RCFlightModeSwitch[] flightModeTopFirstTable() {
+        RCFlightModeSwitch[] table = sFlightModeTopFirst;
+        if (table == null) {
+            table = flightModeTopFirst();
+            sFlightModeTopFirst = table;
+        }
+        return table;
+    }
 
     private static RCFlightModeSwitch[] flightModeTopFirst() {
         if (isRcPro()) {
@@ -1417,8 +1438,9 @@ public final class DjiMsdkBridge {
     private static Integer switchPosition(Object value) {
         if (value instanceof RCFlightModeSwitch) {
             final RCFlightModeSwitch position = (RCFlightModeSwitch) value;
-            for (int index = 0; index < FLIGHT_MODE_TOP_FIRST.length; index++) {
-                if (FLIGHT_MODE_TOP_FIRST[index] == position) {
+            final RCFlightModeSwitch[] topFirst = flightModeTopFirstTable();
+            for (int index = 0; index < topFirst.length; index++) {
+                if (topFirst[index] == position) {
                     return POSITION_TOP_FIRST[index];
                 }
             }
