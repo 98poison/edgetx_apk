@@ -62,6 +62,12 @@
          there needs "All files access", which the user grants once in system settings;
          without it the card stays in the app's own directory (see prepare_sd_root). -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- The settings gear is an overlay window, so it needs "display over other apps".
+         There is no runtime dialog for this one on Android 6+: it is granted with
+         `adb shell appops set com.edgetx.droidui SYSTEM_ALERT_WINDOW allow`, or from the
+         system's own special-access screen. Without it the app is unchanged and the
+         destination address is edited by pushing netlink.conf instead. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <!-- Android 10 has no "All files access" at all (MANAGE_EXTERNAL_STORAGE starts at
          API 30), and the RC Pro is Android 10: there the same card is written with the

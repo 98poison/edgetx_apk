@@ -59,6 +59,32 @@ void requestStick(int axis, int32_t value);
 // the colour-LCD UI.
 void requestDial(uint8_t dial, int32_t value);
 
+// Write an analog channel and a switch position straight to the firmware, from
+// the link thread, without queueing.
+//
+// These exist for the inbound rcbridge bridge (rc_bridge.h), whose tick() runs
+// *inside* this tick() - after the drain loops below - so anything it queued
+// would land on the next pass instead of this one. Queueing would cost a whole
+// tick of latency on every stick movement.
+//
+// They are not a shortcut past the rest of this module, though, and that is why
+// they live here rather than letting rc_bridge.cpp call simu:: directly. An
+// earlier version did that, and it lost three things only this file knows about:
+//
+//   - the firmware mutex, so an injected value could race the input thread's
+//     push_analog on the same channel;
+//   - net_link::onAnalog / onSwitch, so the app's own outbound network mirror
+//     showed stale sticks while the mixer used the fresh ones - two different
+//     views of one control in the same program;
+//   - the log line that says which stick moved.
+//
+// `value` is 0..4096 with centre 2048, which is what simu::pushAnalog takes;
+// rc_bridge.cpp scales its -1000..1000 into that before calling.
+void pushAnalogNow(uint8_t channel, uint16_t value);
+
+// `state` is <0 up, 0 middle, >0 down, as everywhere else.
+void setSwitchNow(uint8_t index, int8_t state);
+
 // Queue rotary encoder steps directly (positive = clockwise = right). The 5-way's
 // up/down use it: up is one step left, down is one step right.
 void requestRotary(int32_t steps);

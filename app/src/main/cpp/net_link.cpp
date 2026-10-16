@@ -411,6 +411,23 @@ Java_com_edgetx_droidui_RcNetLink_nativeConfigure(JNIEnv* env, jclass, jboolean 
     if (text != nullptr) env->ReleaseStringUTFChars(host, text);
 }
 
+// The settings gear changed the destination while the link was up. configure() alone only
+// stores the new values - the sockets and the resolved address are fixed by init() - so this
+// stops the link and starts it again on the new ones. stop() is idempotent, and init() starts
+// nothing while the configuration is disabled, which is how the gear turns the output off.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_RcNetLink_nativeReconfigure(JNIEnv* env, jclass, jboolean enabled,
+                                                    jstring host, jint port, jint crsfPort,
+                                                    jint mode, jint rateHz) {
+    const char* text = nullptr;
+    if (host != nullptr) text = env->GetStringUTFChars(host, nullptr);
+    net_link::stop();
+    net_link::configure(enabled != JNI_FALSE, text, static_cast<uint16_t>(port),
+                        static_cast<uint16_t>(crsfPort), mode, rateHz);
+    if (text != nullptr) env->ReleaseStringUTFChars(host, text);
+    net_link::init();
+}
+
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_edgetx_droidui_RcNetLink_nativeStats(JNIEnv* env, jclass) {
     uint32_t sent = 0, dropped = 0, bytes = 0;

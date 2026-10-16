@@ -6,6 +6,7 @@ import android.util.Log;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 
@@ -67,8 +68,8 @@ final class RcNetLink {
     private static final int DEFAULT_RATE = 50;
 
     /** Stream bits, matching net_link.h Stream { kJson = 1 << 0, kCrsf = 1 << 1 }. */
-    private static final int STREAM_JSON = 1 << 0;
-    private static final int STREAM_CRSF = 1 << 1;
+    static final int STREAM_JSON = 1 << 0;
+    static final int STREAM_CRSF = 1 << 1;
 
     private static boolean sConfigured;
 
@@ -86,23 +87,35 @@ final class RcNetLink {
     static synchronized void start(Context context) {
         if (sConfigured) return;
         sConfigured = true;
+        apply(read(context), false);
+    }
 
-        final File file;
+    /** The file itself - the settings overlay writes it, this class reads it. */
+    static File configFile(Context context) {
         try {
-            file = new File(context.getExternalFilesDir(null), CONFIG);
+            return new File(context.getExternalFilesDir(null), CONFIG);
         } catch (Throwable t) {
             Log.w(TAG, "net: no external files directory, the network output stays off");
-            return;
+            return null;
         }
+    }
 
-        if (!file.isFile()) {
-            // Nothing to do: the native default is "off", so this is not even a call.
-            Log.i(TAG, "net: no " + CONFIG + " in " + file.getParent()
-                    + ", the network output stays off");
-            return;
-        }
-
+    /**
+     * The file's settings with the defaults filled in, never null. Reading is separate from
+     * applying so the settings overlay can show the current values without touching the link.
+     */
+    static Config read(Context context) {
         final Config config = new Config();
+        final File file = configFile(context);
+        if (file == null || !file.isFile()) {
+            // Nothing to read: the native default is "off", so this is not even a call.
+            if (file != null) {
+                Log.i(TAG, "net: no " + CONFIG + " in " + file.getParent()
+                        + ", the network output stays off");
+            }
+            return config;
+        }
+
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(
                 new FileInputStream(file), StandardCharsets.UTF_8))) {
             String line;
@@ -113,26 +126,82 @@ final class RcNetLink {
             }
         } catch (Throwable t) {
             Log.w(TAG, "net: cannot read " + file, t);
+        }
+        return config;
+    }
+
+    /**
+     * Writes the settings back and puts them into the running link - the gear's "save".
+     *
+     * <p>The destination is fixed when the native link starts (see net_link.h), so a changed
+     * host or port needs the stop/init pair behind {@link #nativeReconfigure}; that is also
+     * what makes a change take effect without restarting the app.
+     *
+     * @return null when it worked, otherwise a message for the user
+     */
+    static synchronized String save(Context context, Config config) {
+        final File file = configFile(context);
+        if (file == null) return "没有外部存储目录，无法保存";
+        try {
+            write(file, config);
+        } catch (Throwable t) {
+            Log.w(TAG, "net: cannot write " + file, t);
+            return "写入失败: " + t;
+        }
+        sConfigured = true;
+        apply(config, true);
+        return null;
+    }
+
+    /** Written in exactly the shape {@link #parseLine} reads. */
+    private static void write(File file, Config config) throws IOException {
+        final String mode = config.mode == (STREAM_JSON | STREAM_CRSF) ? "both"
+                : (config.mode == STREAM_CRSF ? "crsf" : "json");
+        final StringBuilder text = new StringBuilder();
+        text.append("# Written by the settings gear on the radio. Every key is documented in\n")
+                .append("# RcNetLink.java and every one of them is optional except host.\n")
+                .append("enabled=").append(config.enabled).append('\n')
+                .append("host=").append(config.host == null ? "" : config.host).append('\n')
+                .append("port=").append(config.port).append('\n')
+                .append("crsf_port=").append(config.crsfPort).append('\n')
+                .append("mode=").append(mode).append('\n')
+                .append("rate=").append(config.rate).append('\n');
+        try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
+            out.write(text.toString().getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * Puts a configuration into the native link, logging what came of it.
+     *
+     * @param live true for a change made while the link is up (stop + init), false for the one
+     *        read at startup, which is stored before the firmware's own {@code init()}
+     */
+    private static void apply(Config config, boolean live) {
+        if (!config.enabled || config.host == null || config.host.isEmpty() || config.mode == 0) {
+            // Off, and saying which of the three ways it got there.
+            if (!config.enabled) {
+                Log.i(TAG, "net: " + CONFIG + " says enabled=false, the network output stays off");
+            } else if (config.host == null || config.host.isEmpty()) {
+                Log.w(TAG, "net: " + CONFIG + " has no host=, the network output stays off");
+            } else {
+                Log.w(TAG, "net: " + CONFIG + " selects no stream, the network output stays off");
+            }
+            if (live) nativeReconfigure(false, "", config.port, config.crsfPort, 0, config.rate);
             return;
         }
 
-        if (!config.enabled) {
-            Log.i(TAG, "net: " + CONFIG + " says enabled=false, the network output stays off");
-            return;
+        if (live) {
+            nativeReconfigure(true, config.host, config.port, config.crsfPort, config.mode,
+                    config.rate);
+        } else {
+            nativeConfigure(true, config.host, config.port, config.crsfPort, config.mode,
+                    config.rate);
         }
-        if (config.host == null) {
-            Log.w(TAG, "net: " + CONFIG + " has no host=, the network output stays off");
-            return;
-        }
-        if (config.mode == 0) {
-            Log.w(TAG, "net: " + CONFIG + " selects no stream, the network output stays off");
-            return;
-        }
-
-        nativeConfigure(true, config.host, config.port, config.crsfPort, config.mode, config.rate);
 
         Log.i(TAG, "net: " + describe(config) + " -> " + config.host + " (controls :"
-                + config.port + ", module :" + config.crsfPort + "), " + config.rate + " Hz");
+                + config.port + ", module :" + config.crsfPort + "), " + config.rate + " Hz"
+                + (live ? " (applied now)" : ""));
     }
 
     /** { sentFrames, droppedFrames, sentBytes, enabled, mode } - for a status log. */
@@ -256,8 +325,11 @@ final class RcNetLink {
         return mode;
     }
 
-    /** The working set of parsed values, defaults filled in. */
-    private static final class Config {
+    /**
+     * The working set of parsed values, defaults filled in. Package private, with package
+     * private fields, because the settings overlay shows and edits exactly these.
+     */
+    static final class Config {
         boolean enabled = false;
         String host = null;
         int port = DEFAULT_PORT;
@@ -268,6 +340,13 @@ final class RcNetLink {
 
     // Configured from Java, owned by net_link.cpp. See net_link.h.
     private static native void nativeConfigure(boolean enabled, String host, int port,
+            int crsfPort, int mode, int rateHz);
+
+    /**
+     * Same, but for a link that is already running: net_link::stop() + configure() + init(),
+     * which is what a changed host or port needs (the destination is resolved once, in init()).
+     */
+    private static native void nativeReconfigure(boolean enabled, String host, int port,
             int crsfPort, int mode, int rateHz);
 
     private static native int[] nativeStats();

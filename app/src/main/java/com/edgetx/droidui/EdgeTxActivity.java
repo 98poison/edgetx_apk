@@ -93,6 +93,11 @@ public class EdgeTxActivity extends NativeActivity {
         EdgeTxApplication.startFromActivity(this);
         super.onCreate(savedInstanceState);
 
+        // The settings gear: a disc drawn over the firmware's screen that opens the
+        // network-forwarding settings, so the destination address can be changed on the radio
+        // instead of by pushing netlink.conf over adb. Nothing about the app depends on it.
+        NetSettingsOverlay.attach(this);
+
         // The two runtime permissions this app has, and neither one has a settings screen that
         // would do: the storage one Android 10 needs for the simulated card (see the class note),
         // and the location one the remote's own GPS is read with (see RcGps). Only what is
@@ -144,6 +149,10 @@ public class EdgeTxActivity extends NativeActivity {
         // window for the USB dialog, and the location permission for the remote's GPS.
         RcGps.start(this);
 
+        // The gear is an overlay window, so it survives this activity going away on its own -
+        // hidden here and shown again in onResume, it stays out of DJI's own screens.
+        NetSettingsOverlay.setVisible(true);
+
         tellAboutMissingLogAccess();
     }
 
@@ -153,6 +162,13 @@ public class EdgeTxActivity extends NativeActivity {
         // A request made without a window is refused without a dialog, so do not ask while the
         // firmware is not the thing on screen; onResume starts the asking again.
         handler.removeCallbacks(usbAsk);
+        NetSettingsOverlay.setVisible(false);
+    }
+
+    @Override
+    protected void onDestroy() {
+        NetSettingsOverlay.detach();
+        super.onDestroy();
     }
 
     /**

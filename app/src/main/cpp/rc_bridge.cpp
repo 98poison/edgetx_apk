@@ -37,10 +37,35 @@ namespace {
 constexpr uint32_t kMagic = 0x31424352u;  // "RCB1" read as little-endian
 constexpr uint32_t kPacketSize = 48;
 
+// Source ids, mirrored from rcbridge's proto.go.
+constexpr uint8_t kSrcEvdev = 0;
 constexpr uint8_t kSrcMSDK = 1;
+constexpr uint8_t kSrcEdgeTX = 2;
 
 constexpr uint8_t kFlagAxes = 1 << 0;
 constexpr uint8_t kFlagButtons = 1 << 1;
+
+// Whether a packet came from something that should be listened to.
+//
+// The list is the point of this function. rcbridge tags the packets it sends on
+// this link SrcEdgeTX - it is the EdgeTX sender in edgetx.go, whatever read the
+// buttons underneath - and an earlier version of this file accepted only
+// kSrcMSDK, which is how a packet that looked entirely correct got counted as
+// rejected: the magic matched, the length matched, every field decoded, and the
+// one byte checked afterwards said "not from the collector", so nothing was ever
+// applied. The whole injection path was dead while reporting "0 accepted, N
+// rejected" - which reads like a wiring problem and is in fact a source-id
+// mismatch.
+//
+// So: accept every source rcbridge defines. Rejecting an id we do not recognise
+// is still worth doing, because it catches a version mismatch, but it must not be
+// a list that can go stale. SrcEvdev is included for completeness - rcbridge
+// never sends it on this link, since the evdev reader is inside rcbridge - and
+// rejecting it would be wrong if that ever changes.
+constexpr bool kKnownSrc(uint8_t src)
+{
+    return src == kSrcMSDK || src == kSrcEdgeTX || src == kSrcEvdev;
+}
 
 #pragma pack(push, 1)
 struct Packet {
@@ -126,9 +151,14 @@ constexpr uint8_t kKeySys = 13;
 constexpr uint8_t kKeyModel = 11;
 constexpr uint8_t kKeyTele = 12;
 
-// Analog channels (simu_host.h): 0 LH, 1 LV, 2 RV, 3 RH, 4 P1, 5 P2, 6 SL1, 7 SL2.
-constexpr uint8_t kAnalogLH = 0, kAnalogLV = 1, kAnalogRV = 2, kAnalogRH = 3;
-constexpr uint8_t kAnalogP1 = 4, kAnalogP2 = 5;
+// The two dials, on the board's pot inputs (simu_host.h: 4 = P1, 5 = P2), which
+// is what a radio normally drives its pots from - volume and backlight through
+// a special function both work.
+//
+// The sticks deliberately have no constants here. Their channel order differs
+// from the packet's, so they need the table in apply(), and a pair of constants
+// that looked like a mapping but was not is what put roll on the elevator.
+constexpr uint8_t kDialChannelFirst = 4;  // P1, then P2
 
 // ------------------------------------------------------------- state ----
 //
@@ -199,7 +229,9 @@ int16_t clampAxis(int16_t v)
 
 void pushSwitch(uint8_t index, int8_t state)
 {
-    simu::setSwitch(index, state);
+    // Through joystick::, not simu:: directly. That is what keeps the firmware
+    // mutex and the network mirror - see joystick.h: setSwitchNow.
+    joystick::setSwitchNow(index, state);
     // The library keeps its own copy so the boot's switch reset cannot undo it
     // (see simu_host.h: setSwitch).
     if (edgetxAndroidSetSwitch != nullptr) edgetxAndroidSetSwitch(index, state);
@@ -387,25 +419,31 @@ uint16_t toAnalog(int16_t v);
 void apply(const Mailbox& m)
 {
     if (m.flags & kFlagAxes) {
+        // The packet's order is LH LV RH RV (proto.go's AxisLH..AxisRV) and the
+        // firmware's channel order is 0 LH, 1 LV, 2 RV, 3 RH - so the right stick
+        // arrives transposed relative to the channel it belongs on. Pushing
+        // index i to channel kAnalogLH + i would put roll on the elevator and
+        // pitch on the aileron, which flies.
+        //
+        // kStickChannels in joystick.cpp is the same table, and using it rather
+        // than restating it here is what keeps the two paths from disagreeing.
+        constexpr uint8_t kStickChannel[4] = {0, 1, 3, 2};  // LH LV RH RV -> 0 1 3 2
         for (int i = 0; i < 4; ++i) {
             const int16_t v = m.sticks[i];
-            if (v != g_sticks[i]) {
-                simu::pushAnalog(kAnalogLH + i, toAnalog(v));
-                simu::setAnalogSource(true);
-                g_sticks[i] = v;
-                g_axesPushes.fetch_add(1, std::memory_order_relaxed);
-            }
+            if (v == g_sticks[i]) continue;
+            joystick::pushAnalogNow(kStickChannel[i], toAnalog(v));
+            g_sticks[i] = v;
+            g_axesPushes.fetch_add(1, std::memory_order_relaxed);
         }
         // The dials land on P1/P2, which is what a radio normally uses its pots
         // for - volume and backlight through a special function both work.
+        // They happen to be in channel order already, so no table is needed.
         for (int i = 0; i < 2; ++i) {
             const int16_t v = m.dials[i];
-            if (v != g_dials[i]) {
-                simu::pushAnalog(kAnalogP1 + i, toAnalog(v));
-                simu::setAnalogSource(true);
-                g_dials[i] = v;
-                g_axesPushes.fetch_add(1, std::memory_order_relaxed);
-            }
+            if (v == g_dials[i]) continue;
+            joystick::pushAnalogNow(static_cast<uint8_t>(kDialChannelFirst + i), toAnalog(v));
+            g_dials[i] = v;
+            g_axesPushes.fetch_add(1, std::memory_order_relaxed);
         }
 
         // The flight-mode switch is a position, not a toggle, so it is pushed
@@ -492,7 +530,7 @@ void receiveLoop(int fd)
         // and rcbridge only uses it to tell a live link from a dead one.
         Packet probe{};
         memcpy(&probe, buf.data(), std::min<size_t>(sizeof(probe), n));
-        if (probe.magic == kMagic && probe.src == kSrcMSDK) {
+        if (probe.magic == kMagic && kKnownSrc(probe.src)) {
             sendAck(probe.seq);
         }
 
@@ -583,8 +621,14 @@ void onPacket(const uint8_t* data, uint32_t len)
     Packet p;
     memcpy(&p, data, sizeof(p));
 
-    if (p.magic != kMagic || p.src != kSrcMSDK) {
+    if (p.magic != kMagic || !kKnownSrc(p.src)) {
         g_bad.fetch_add(1, std::memory_order_relaxed);
+        // Logged rather than silently counted, because "rejected" with no reason
+        // is the hardest kind of failure to act on: the log says packets are
+        // arriving and being thrown away, which points at the radio and the
+        // network, and both look fine.
+        LOGW("bridge: rejected a %u-byte packet (magic 0x%08x, src %u)",
+             (unsigned)len, (unsigned)p.magic, (unsigned)p.src);
         return;
     }
 
