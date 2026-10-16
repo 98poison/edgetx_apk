@@ -99,16 +99,56 @@ jobs:
       - name: Install SDK packages (platform, build-tools, NDK, CMake)
         shell: pwsh
         run: |
-          $sm = "$env:ANDROID_SDK_ROOT\cmdline-tools\latest\bin\sdkmanager.bat"
-          for ($i = 0; $i -lt 50; $i++) { "y" } | & $sm --licenses | Out-Null
+          $sdkRoot = $env:ANDROID_SDK_ROOT
+          $sm      = "$sdkRoot\cmdline-tools\latest\bin\sdkmanager.bat"
+          Write-Host "sdk root   : $sdkRoot"
+          Write-Host "sdkmanager : $sm"
+          Write-Host "exists     : $(Test-Path $sm)"
+          Write-Host "java home  : $env:JAVA_HOME"
+
+          # Accept the SDK licences up front by writing the hash files
+          # sdkmanager reads. Piping "y" into `sdkmanager --licenses` is not
+          # reliable from PowerShell, and a rejected licence aborts the install
+          # before a single byte is downloaded.
+          New-Item -ItemType Directory -Force -Path "$sdkRoot\licenses" | Out-Null
+          $hashes = @(
+            "24333f8a63b6825ea9c5514f83c2829b004d1fee",
+            "8933bad161af4178b1185d1a37fbf41ea5269c55",
+            "d56f5187479451eabf01fb78af6dfcb131a6481e",
+            "84831b9409646a918e30573bab4c9c91346d8abd"
+          )
+          $licenseFiles = @(
+            "android-sdk-license", "android-sdk-preview-license",
+            "android-googletv-license", "android-sdk-arm-dbt-license"
+          )
+          foreach ($name in $licenseFiles) {
+            $hashes | Out-File "$sdkRoot\licenses\$name" -Encoding ascii
+            Write-Host "licence accepted: $name"
+          }
+
           # build-tools revisions are three-part ("36.1.0", never "36.1"). AGP
-          # picks its own revision when the module does not pin one, so keep
-          # both current 36.x revisions installed.
-          & $sm "platform-tools" "platforms;$env:PLATFORM" `
-                "build-tools;$env:BUILD_TOOLS" "build-tools;36.0.0" `
-                "ndk;$env:NDK_VERSION" "cmake;$env:CMAKE_VERSION"
-          if ($LASTEXITCODE -ne 0) { throw "sdkmanager exited with $LASTEXITCODE" }
-          Get-ChildItem "$env:ANDROID_SDK_ROOT\build-tools" -Directory | ForEach-Object { "build-tools: $($_.Name)" }
+          # picks its own revision when the module does not pin one, so install
+          # both current 36.x revisions.
+          $pkgs = @(
+            "platform-tools"
+            "platforms;$env:PLATFORM"
+            "build-tools;$env:BUILD_TOOLS"
+            "build-tools;36.0.0"
+            "ndk;$env:NDK_VERSION"
+            "cmake;$env:CMAKE_VERSION"
+          )
+          Write-Host "installing : $($pkgs -join ' ')"
+          $out  = & $sm "--sdk_root=$sdkRoot" @pkgs 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host "sdkmanager: $_" }
+          if ($code -ne 0) {
+            # Put the reason in a check annotation: that stays readable through
+            # the REST API even when the web UI is unreachable.
+            $tail = (($out | Select-Object -Last 25) -join "%0A")
+            Write-Host "::error title=sdkmanager failed::$tail"
+            throw "sdkmanager exited with $code"
+          }
+          Get-ChildItem "$sdkRoot\build-tools" -Directory | ForEach-Object { Write-Host "build-tools: $($_.Name)" }
 
       - name: Write local.properties
         shell: pwsh
