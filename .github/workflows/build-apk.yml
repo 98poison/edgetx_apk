@@ -65,7 +65,7 @@ jobs:
     env:
       NDK_VERSION: "28.2.13676358"
       CMAKE_VERSION: "3.22.1"
-      BUILD_TOOLS: "36.1"
+      BUILD_TOOLS: "36.1.0"
       PLATFORM: "android-36"
       ANDROID_SDK_ROOT: "${{ github.workspace }}/android-sdk"
       ANDROID_HOME: "${{ github.workspace }}/android-sdk"
@@ -101,7 +101,14 @@ jobs:
         run: |
           $sm = "$env:ANDROID_SDK_ROOT\cmdline-tools\latest\bin\sdkmanager.bat"
           for ($i = 0; $i -lt 50; $i++) { "y" } | & $sm --licenses | Out-Null
-          & $sm "platform-tools" "platforms;$env:PLATFORM" "build-tools;$env:BUILD_TOOLS" "ndk;$env:NDK_VERSION" "cmake;$env:CMAKE_VERSION"
+          # build-tools revisions are three-part ("36.1.0", never "36.1"). AGP
+          # picks its own revision when the module does not pin one, so keep
+          # both current 36.x revisions installed.
+          & $sm "platform-tools" "platforms;$env:PLATFORM" `
+                "build-tools;$env:BUILD_TOOLS" "build-tools;36.0.0" `
+                "ndk;$env:NDK_VERSION" "cmake;$env:CMAKE_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "sdkmanager exited with $LASTEXITCODE" }
+          Get-ChildItem "$env:ANDROID_SDK_ROOT\build-tools" -Directory | ForEach-Object { "build-tools: $($_.Name)" }
 
       - name: Write local.properties
         shell: pwsh
