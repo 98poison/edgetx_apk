@@ -7,6 +7,7 @@ import android.util.Log;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.lang.reflect.Method;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import rikka.shizuku.Shizuku;
 
@@ -72,6 +73,7 @@ final class RcShellKeys {
     private static final long RETRY_MS = 5000;
 
     private static final Object LOCK = new Object();
+    private static final AtomicBoolean sAskedPermission = new AtomicBoolean();
     private static Context sContext;
     private static Process sProcess;
     private static boolean sReading;
@@ -121,7 +123,10 @@ final class RcShellKeys {
 
         try {
             Shizuku.addRequestPermissionResultListener(PERMISSION_RESULT);
-            Shizuku.addBinderReceivedListener(BINDER_UP);
+            // Sticky rather than the plain one: whether the binder is already there by the
+            // time this runs is a race with how fast the provider was created, and the
+            // plain listener only fires for a binder that arrives afterwards.
+            Shizuku.addBinderReceivedListenerSticky(BINDER_UP);
             Shizuku.addBinderDeadListener(BINDER_DOWN);
         } catch (Throwable t) {
             // Nothing about Shizuku is essential: without it the buttons behave as they
@@ -131,17 +136,38 @@ final class RcShellKeys {
             return;
         }
 
-        try {
-            Log.i(TAG, "shizuku: server version " + Shizuku.getVersion());
-        } catch (Throwable t) {
-            // The most common case by far: Shizuku is installed but not started. The
-            // binder listener above starts the reader if it comes up later.
-            Log.i(TAG, "shizuku: not running (" + t.getClass().getSimpleName()
-                    + "); the shoulder buttons come from Android");
-            return;
-        }
+        waitForBinder();
+    }
 
-        requestOrRead();
+    /**
+     * Shizuku's binder is handed to the provider a moment *after* the process starts
+     * (measured: the provider initialises, and a tenth of a second later the service is
+     * still not there), so the first look almost always fails. This waits for it, and the
+     * sticky listener above catches a binder that arrives even later.
+     */
+    private static void waitForBinder() {
+        final Thread thread = new Thread(() -> {
+            for (int attempt = 0; attempt < 60; attempt++) {
+                try {
+                    if (Shizuku.pingBinder()) {
+                        Log.i(TAG, "shizuku: server version " + Shizuku.getVersion());
+                        requestOrRead();
+                        return;
+                    }
+                } catch (Throwable t) {
+                    // still not there; the next round tries again
+                }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+            Log.i(TAG, "shizuku: no server after 60 s; the shoulder buttons come from Android "
+                    + "(they keep working while a window exists)");
+        }, "rc-shizuku-wait");
+        thread.setDaemon(true);
+        thread.start();
     }
 
     private static void requestOrRead() {
@@ -150,8 +176,10 @@ final class RcShellKeys {
                 startReader();
                 return;
             }
-            Log.i(TAG, "shizuku: asking for permission to read " + NODE);
-            Shizuku.requestPermission(REQUEST_CODE);
+            if (sAskedPermission.compareAndSet(false, true)) {
+                Log.i(TAG, "shizuku: asking for permission to read " + NODE);
+                Shizuku.requestPermission(REQUEST_CODE);
+            }
         } catch (Throwable t) {
             Log.w(TAG, "shizuku: could not ask for the permission", t);
         }
