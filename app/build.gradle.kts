@@ -39,6 +39,24 @@ val djiAppKey = (project.findProperty("dji.appKey") as String?) ?: localProps.ge
 val targetAbis = ((findProperty("abis") as String?) ?: "arm64-v8a")
     .split(",").map { it.trim() }.filter { it.isNotEmpty() }
 
+// ---------------------------------------------------------------------------
+// Signing certificate
+//
+// The DJI App Key (see above) is bound to the *signing certificate* as well as the
+// package name, so the certificate has to be the same on every build. The debug
+// keystore cannot do that: on a machine that has never built before - which is what
+// every CI runner is - the Android plugin generates one, with a fresh key pair, so
+// the certificate changes from run to run and an App Key stops matching.
+//
+// signing/release.keystore is therefore committed instead. The CI job fails rather
+// than silently creating a different one; see "Prepare the signing keystore" in
+// .github/workflows/build-apk.yml. The password is public on purpose - this key
+// only exists to keep the certificate stable, and the APK is installed by hand.
+// ---------------------------------------------------------------------------
+val releaseKeystore = rootProject.file("signing/release.keystore")
+val releaseKeystorePassword = "edgetx"
+val releaseKeystoreAlias = "edgetx"
+
 android {
     namespace = "com.edgetx.droidui"
     compileSdk = 36
@@ -85,12 +103,27 @@ android {
         }
     }
 
+    signingConfigs {
+        if (releaseKeystore.isFile) {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeystoreAlias
+                keyPassword = releaseKeystorePassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Signed with the debug keystore so the release APK can be installed
-            // directly on a phone. Swap in a real keystore for distribution.
-            signingConfig = signingConfigs.getByName("debug")
+            // signing/release.keystore when it is in the checkout (that is what CI
+            // commits, see the workflow), so the certificate does not change between
+            // builds. The debug keystore otherwise - which is fine locally, but note
+            // that on a *clean* machine it is generated fresh, so an App Key bound to
+            // it stops matching on the next one.
+            signingConfig = if (releaseKeystore.isFile) signingConfigs.getByName("release")
+            else signingConfigs.getByName("debug")
         }
     }
 
@@ -369,6 +402,13 @@ dependencies {
     // USB-serial bridges (FTDI, CP210x, CH34x, PL2303), which is what a module
     // or a module adapter presents to the RC.
     implementation("com.github.mik3y:usb-serial-for-android:3.8.1")
+
+    // RcShellKeys: the shoulder buttons, read from the kernel's input node as the shell
+    // user, so they keep working after the UI is gone - Android only delivers key events
+    // to a window that has focus. Inert unless Shizuku is installed, running and has
+    // granted this app the permission.
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     if (djiMsdkEnabled) {
         implementation("com.dji:dji-sdk-v5-aircraft:$djiMsdkVersion")

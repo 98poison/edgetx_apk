@@ -137,6 +137,12 @@ public class EdgeTxApplication extends Application {
         // position every 2.5 ms. The SDK stays as the fallback, see RcRawJoystick.
         RcRawJoystick.start(this);
 
+        // The same shoulder buttons again, from the kernel's input node through Shizuku:
+        // that is the copy that keeps arriving when the UI is gone. Android stays the
+        // source while a window exists; the native side drops the duplicate (see
+        // joystick.cpp: noteNodeEdge).
+        RcShellKeys.start(this);
+
         // The buttons the remote's own handler logs, which on the RC Pro is the reliable
         // source for the pause, landing and custom buttons. Inert without READ_LOGS, see
         // RcDpadLog - the SDK paths then behave exactly as they did before.

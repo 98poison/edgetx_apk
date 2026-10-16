@@ -45,6 +45,10 @@ on:
         description: "(dji_msdk) App Key from developer.dji.com, bound to com.edgetx.droidui + the signing certificate"
         type: string
         default: ""
+      new_signing_key:
+        description: "Create signing/release.keystore if it is missing (then commit it - the DJI App Key is bound to that certificate)"
+        type: boolean
+        default: false
 
   # Triggerable without the Actions web UI, which needs nothing beyond a token
   # with Contents: write:
@@ -70,6 +74,21 @@ jobs:
       ANDROID_SDK_ROOT: "${{ github.workspace }}/android-sdk"
       ANDROID_HOME: "${{ github.workspace }}/android-sdk"
 
+      # A run started from the Actions tab passes workflow inputs; one started through
+      # the API (repository_dispatch, see tools/dispatch-build.ps1) passes no inputs at
+      # all but a client_payload. Both are read here, so the same build can be started
+      # either way:
+      #   POST /repos/{owner}/{repo}/dispatches
+      #   {"event_type":"build-apk","client_payload":{
+      #      "edgetx_mode":"prebuilt","dji_msdk":"true","dji_app_key":"..."}}
+      EDGETX_MODE: ${{ github.event.client_payload.edgetx_mode || inputs.edgetx_mode || 'prebuilt' }}
+      EDGETX_REPO: ${{ github.event.client_payload.edgetx_repo || inputs.edgetx_repo || 'https://github.com/cpp2go/edgetx_esp32' }}
+      EDGETX_REF: ${{ github.event.client_payload.edgetx_ref || inputs.edgetx_ref || '793e11364f30ca39acfbc153a83da093f8e32c81' }}
+      SIM_LIB_URL: ${{ github.event.client_payload.sim_lib_url || inputs.sim_lib_url || '' }}
+      DJI_MSDK: ${{ github.event.client_payload.dji_msdk || inputs.dji_msdk || 'false' }}
+      DJI_APP_KEY: ${{ github.event.client_payload.dji_app_key || inputs.dji_app_key || '' }}
+      NEW_SIGNING_KEY: ${{ github.event.client_payload.new_signing_key || inputs.new_signing_key || 'false' }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -80,7 +99,7 @@ jobs:
           java-version: "21"
 
       - name: Set up Python 3.11
-        if: ${{ inputs.edgetx_mode == 'source' }}
+        if: ${{ env.EDGETX_MODE == 'source' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -189,16 +208,16 @@ jobs:
       # source mode: the public EdgeTX fork + the compatibility shim
       # ------------------------------------------------------------------
       - name: Check out the EdgeTX fork
-        if: ${{ inputs.edgetx_mode == 'source' }}
+        if: ${{ env.EDGETX_MODE == 'source' }}
         shell: pwsh
         run: |
           git config --global core.longpaths true
-          git clone --recursive "${{ inputs.edgetx_repo }}" edgetx
-          git -C edgetx checkout "${{ inputs.edgetx_ref }}"
+          git clone --recursive "${{ env.EDGETX_REPO }}" edgetx
+          git -C edgetx checkout "${{ env.EDGETX_REF }}"
           git -C edgetx submodule update --init --recursive
 
       - name: Create the EdgeTX Python virtualenv
-        if: ${{ inputs.edgetx_mode == 'source' }}
+        if: ${{ env.EDGETX_MODE == 'source' }}
         shell: pwsh
         run: |
           python -m venv edgetx\.venv
@@ -206,7 +225,7 @@ jobs:
           edgetx\.venv\Scripts\python.exe -m pip install pydantic clang
 
       - name: Apply the Android host patch
-        if: ${{ inputs.edgetx_mode == 'source' }}
+        if: ${{ env.EDGETX_MODE == 'source' }}
         shell: pwsh
         run: python patches\apply.py edgetx
 
@@ -214,14 +233,14 @@ jobs:
       # prebuilt mode: fetch/extract libedgetx-st16mk3-simulator.so
       # ------------------------------------------------------------------
       - name: Stage prebuilt simulator library (from URL)
-        if: ${{ inputs.edgetx_mode != 'source' && inputs.sim_lib_url != '' }}
+        if: ${{ env.EDGETX_MODE != 'source' && env.SIM_LIB_URL != '' }}
         shell: pwsh
         run: |
           $out = "app\build\edgetx-libs\arm64-v8a"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $dst = "$out\libedgetx-st16mk3-simulator.so"
           $dl  = "$env:RUNNER_TEMP\simlib.bin"
-          Invoke-WebRequest -Uri "${{ inputs.sim_lib_url }}" -OutFile $dl
+          Invoke-WebRequest -Uri "${{ env.SIM_LIB_URL }}" -OutFile $dl
           $magic = [System.IO.File]::ReadAllBytes($dl)[0..1]
           if ($magic[0] -eq 0x50 -and $magic[1] -eq 0x4B) {
             # PK -> it is an APK (zip); pull the library out of it.
@@ -234,7 +253,7 @@ jobs:
           Get-Item $dst | Format-List Length,FullName
 
       - name: Stage the committed simulator library (prebuilt fallback)
-        if: ${{ inputs.edgetx_mode != 'source' && inputs.sim_lib_url == '' }}
+        if: ${{ env.EDGETX_MODE != 'source' && env.SIM_LIB_URL == '' }}
         shell: pwsh
         run: |
           # The GitHub web uploader silently drops hidden (dot-prefixed) entries, so
@@ -252,18 +271,47 @@ jobs:
           Copy-Item $src "app\build\edgetx-libs\arm64-v8a\libedgetx-st16mk3-simulator.so" -Force
           Get-Item "app\build\edgetx-libs\arm64-v8a\libedgetx-st16mk3-simulator.so" | Format-List Length,FullName
 
+      # The DJI App Key is bound to the package name *and* the signing certificate, so
+      # the certificate has to be the same on every build. signing/release.keystore is
+      # committed for that reason; this step only has to create it once, print it so it
+      # can be committed, and fail loudly if someone removed it (a fresh keystore means
+      # a fresh certificate, and an App Key that quietly stops working).
+      - name: Prepare the signing keystore
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path signing | Out-Null
+          if (Test-Path signing\release.keystore) {
+            Write-Host "signing/release.keystore is in the checkout"
+          } elseif ("$env:NEW_SIGNING_KEY" -eq "true") {
+            Write-Host "creating signing/release.keystore (new_signing_key=true)"
+            & keytool -genkeypair -keystore signing\release.keystore -alias edgetx `
+              -keyalg RSA -keysize 2048 -validity 10950 `
+              -storepass edgetx -keypass edgetx `
+              -dname "CN=EdgeTX Android, O=EdgeTX, C=CN"
+            if ($LASTEXITCODE -ne 0) { Write-Error "keytool could not create the keystore" }
+            $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("signing\release.keystore"))
+            Write-Host "::notice title=Commit signing/release.keystore::This run created the signing keystore. Commit it so the certificate never changes: base64 of signing/release.keystore follows."
+            Write-Host "RELEASE-KEYSTORE-BASE64-BEGIN"
+            Write-Host $b64
+            Write-Host "RELEASE-KEYSTORE-BASE64-END"
+          } else {
+            Write-Error "signing/release.keystore is missing. The DJI App Key is bound to the signing certificate, so the APK must not be signed with a certificate that changes from run to run. Re-run with new_signing_key=true to create one, then commit it."
+          }
+          & keytool -list -v -keystore signing\release.keystore -storepass edgetx |
+            Select-String -Pattern 'Alias name|SHA1:|SHA256:'
+
       - name: Build APK
         shell: pwsh
         run: |
           $gradleArgs = @()
-          if ("${{ inputs.edgetx_mode }}" -ne "source") {
+          if ($env:EDGETX_MODE -ne "source") {
             $gradleArgs += "-Pedgetx.skipBuild=true"
           } else {
             $dir = ("$env:GITHUB_WORKSPACE\edgetx" -replace '\\','/')
             $gradleArgs += "-Pedgetx.dir=$dir"
           }
-          if ("${{ inputs.dji_msdk }}" -eq "true") { $gradleArgs += "-Pdji.msdk=true" }
-          if ("${{ inputs.dji_app_key }}" -ne "") { $gradleArgs += "-Pdji.appKey=${{ inputs.dji_app_key }}" }
+          if ($env:DJI_MSDK -eq "true") { $gradleArgs += "-Pdji.msdk=true" }
+          if ($env:DJI_APP_KEY -ne "") { $gradleArgs += "-Pdji.appKey=$env:DJI_APP_KEY" }
 
           $logFile = "$env:RUNNER_TEMP\gradle.log"
           & .\gradlew.bat --no-daemon :app:assembleRelease @gradleArgs 2>&1 |
@@ -286,14 +334,14 @@ jobs:
           }
           Get-Item app\build\outputs\apk\release\app-release.apk | Format-List Length,FullName
 
-      # The DJI App Key is bound to the package name *and* the signing
-      # certificate, so print the fingerprint that developer.dji.com must be
-      # given. The release APK is signed with the debug keystore
-      # (app/build.gradle.kts), whose Android Debug certificate is stable.
+      # Print both certificates of the finished APK: what the DJI App Key has to be
+      # registered against (the signer), and the whole file's digest (a quick way to
+      # tell two builds apart).
       - name: Print the APK signing certificate (for the DJI App Key)
-        if: ${{ inputs.dji_msdk }}
         shell: pwsh
-        run: keytool -printcert -jarfile app\build\outputs\apk\release\app-release.apk
+        run: |
+          & keytool -printcert -jarfile app\build\outputs\apk\release\app-release.apk |
+            Select-String -Pattern 'Signer|Owner:|SHA1:|SHA256:|SHA-1|SHA-256'
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

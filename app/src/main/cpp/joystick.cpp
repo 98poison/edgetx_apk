@@ -132,18 +132,14 @@ struct KeyChoice {
 // DjiMsdkBridge -> nativeOnDjiButton), because the RC firmware never dispatches
 // their events to apps.
 //
-// The RC's right-hand shoulder buttons are EdgeTX keys rather than switches, so
-// that a single press opens the setup, model and telemetry pages - the same
-// thing the hardware TX16S does with its SYS/MDL/TELE buttons, which this remote
-// does not have. The DJI SDK's own C1/C2/C3 custom-button event is not usable
-// here: the RcCustomButtonEvent listener never fires on this remote, so the
-// buttons are taken from the Android key codes the kernel reports for them.
+// The buttons that are EdgeTX *keys* rather than switches. A key opens a menu
+// page (or confirms); a switch is a value the mixer can drive a channel from,
+// which is what everything else on this remote is. The two below are all that
+// is left here: the shoulders L1..L3 used to be SYS/MDL/TELE, and are switches
+// now (see kSwitchKeys) so that they can be used as inputs.
 const KeyChoice kKeyMap[] = {
     {AKEYCODE_BACK, kKeyExit},            // the remote's RTN (return) button
     {AKEYCODE_BUTTON_THUMBL, kKeyEnter},  // 5-way centre press
-    {AKEYCODE_F1, kKeySys},               // L1 -> SYS  (radio setup)
-    {AKEYCODE_F2, kKeyModel},             // L2 -> MDL  (model setup)
-    {AKEYCODE_F3, kKeyTele},              // L3 -> TELE (telemetry)
 };
 
 // ------------------------------------------------------------------ state ----
@@ -794,24 +790,22 @@ std::chrono::steady_clock::time_point g_thumbLAt{};
 bool g_thumbLSeen = false;
 constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 
-// The RC's R1/R2/R3 buttons arrive as plain Android key codes F4..F6 (measured - the SDK's
-// own boolean button keys are all silent for them) and each drives one momentary EdgeTX
-// switch: pressed = down, released = up. They are SG/SH/SI, the switches the RC's C1/C2/C3
-// buttons used to drive; C1/C2/C3 now pick the position of the 3-position switch SF
-// instead, and they can do that from the DJI SDK (see DjiMsdkBridge.listenPositionButton) -
-// which is also why SF is the switch that keeps being usable with the UI closed.
+// The RC's shoulder buttons all arrive as plain Android key codes, F1..F6 (measured - the
+// SDK's own boolean button keys are all silent for them), and each drives one momentary
+// EdgeTX switch: pressed = down, released = up. R1..R3 are SG/SH/SI, the switches the RC's
+// C1/C2/C3 buttons used to drive; C1/C2/C3 now pick the position of the 3-position switch
+// SF instead, and they can do that from the DJI SDK (see DjiMsdkBridge.listenPositionButton).
+// L1..L3 are SB/SF/SJ, the three positions only the SDK can otherwise move - see kSwitchKeys.
 //
-// The L1/L2/L3 buttons (F1..F3) are EdgeTX keys instead, see kKeyMap above.
-//
-// Android only delivers key events to the window that has focus, so these three - and
-// with them L1/L2/L3 (F1..F3) and the RC's RTN button (BACK) - stop arriving as soon as
-// the UI is gone (the app swiped away; RcLinkService keeps the *firmware* running, but
-// there is no window left to receive keys). Everything the DJI SDK reports keeps coming:
-// the sticks, the dials and the switches DjiMsdkBridge drives (SA/SD/SE/SF/SC/SJ).
-// There is no way around it from here - the kernel's input node is root:input 0660 and
-// the only permission that grants that group is signature-level - so a switch that has to
-// be usable with the UI closed has to come from the SDK. The positions the switches are
-// left in are kept, they simply cannot be moved while no window exists.
+// Android only delivers key events to the window that has focus, so all six - and with them
+// the RC's RTN button (BACK) - stop arriving as soon as the UI is gone (the app swiped away;
+// RcLinkService keeps the *firmware* running, but there is no window left to receive keys).
+// Everything the DJI SDK reports keeps coming: the sticks, the dials and the switches
+// DjiMsdkBridge drives (SA/SD/SE/SF/SC/SJ). The kernel's own input node keeps reporting the
+// shoulders too - it is root:input 0660 and no app permission grants that group - but a
+// process running as the shell user may read it, which is what RcShellKeys does through
+// Shizuku: the same six buttons, with no window needed. Both copies then exist while the UI
+// is up, so whichever arrives second is dropped (see handleKeyCode).
 //
 // The photo, video and pause buttons are NOT here: their kernel key codes never
 // reach an app (the RC's own dpad service consumes them, and pause is not in the
@@ -827,9 +821,19 @@ struct SwitchKey {
     int8_t  state;   // the position the switch takes while the button is held
 };
 
-// Board switch table (tx16smk3.json): 6 = SG, 7 = SH, 8 = SI. All three are momentary, so
-// the release puts them back up.
+// Board switch table (tx16smk3.json): 1 = SB, 5 = SF, 6 = SG, 7 = SH, 8 = SI,
+// 9 = SJ. All of them are momentary here, so the release puts them back up.
+//
+// R1..R3 take SG/SH/SI. The three L buttons take the positions that nothing but
+// the DJI SDK can move (SB is the flight-mode switch, SF is where C1/C2/C3 pick a
+// position, SJ is C4 and the arm state): with the SDK out of the build they are
+// dead positions, which is exactly what makes them safe to hand to a button. Do
+// turn the SDK back on and those three move for themselves again (DjiMsdkBridge
+// drives the same positions), so L1..L3 would then have to share them.
 const SwitchKey kSwitchKeys[] = {
+    {AKEYCODE_F1, 1, 1},  // L1 -> SB down while held
+    {AKEYCODE_F2, 5, 1},  // L2 -> SF down while held
+    {AKEYCODE_F3, 9, 1},  // L3 -> SJ down while held
     {AKEYCODE_F4, 6, 1},  // R1 -> SG down while held
     {AKEYCODE_F5, 7, 1},  // R2 -> SH down while held
     {AKEYCODE_F6, 8, 1},  // R3 -> SI down while held
@@ -1039,6 +1043,41 @@ bool handle_exit_click(bool down) {
     return true;
 }
 
+// ---- the same buttons, from the kernel's input node (RcShellKeys.java) ----
+//
+// The kernel keeps reporting the shoulders with no window in sight, and that node
+// is what RcShellKeys reads through Shizuku (see the note above kSwitchKeys).
+// While the UI *is* up both copies arrive, milliseconds apart, so an edge the node
+// has just delivered is not acted on a second time here. The window is wide next
+// to that gap, and far too short for a hand to press the same button twice.
+constexpr auto kNodeHandoverWindow = std::chrono::milliseconds(200);
+std::mutex g_nodeLock;
+std::map<int32_t, std::chrono::steady_clock::time_point> g_nodeEdgeAt;
+
+void noteNodeEdge(int32_t keycode) {
+    std::lock_guard<std::mutex> lock(g_nodeLock);
+    g_nodeEdgeAt[keycode] = std::chrono::steady_clock::now();
+}
+
+bool nodeEdgeJustSeen(int32_t keycode) {
+    std::lock_guard<std::mutex> lock(g_nodeLock);
+    const auto it = g_nodeEdgeAt.find(keycode);
+    if (it == g_nodeEdgeAt.end()) return false;
+    return std::chrono::steady_clock::now() - it->second < kNodeHandoverWindow;
+}
+
+std::vector<int32_t> g_loggedNodeDedup;
+
+void logNodeDedupOnce(int32_t keycode) {
+    if (std::find(g_loggedNodeDedup.begin(), g_loggedNodeDedup.end(), keycode) !=
+        g_loggedNodeDedup.end()) {
+        return;
+    }
+    g_loggedNodeDedup.push_back(keycode);
+    LOGI("joystick: button keycode %d (%s) came from the input node, Android's copy ignored",
+         keycode, key_name(keycode));
+}
+
 // One button edge, whoever it came from: Android's input queue, or the raw joystick
 // reader (see RcRawJoystick.java). The second source exists because of the return button:
 // Android only ever sees RTN as a tap re-injected by the RC's own service, and that
@@ -1095,6 +1134,12 @@ bool handleKeyEvent(AInputEvent* event) {
     }
 
     const bool down = (action == AKEY_EVENT_ACTION_DOWN);
+    // Android's copy of a shoulder button the kernel node has just reported (see
+    // noteNodeEdge): both sources are live while a window exists.
+    if (nodeEdgeJustSeen(keycode)) {
+        logNodeDedupOnce(keycode);
+        return true;
+    }
     return handleKeyCode(keycode, down);
 }
 
@@ -1649,6 +1694,31 @@ void restoreSwitches() {
     }
 }
 
+// See joystick.h for why the inbound rcbridge bridge needs un-queued access.
+void pushAnalogNow(uint8_t channel, uint16_t value) {
+    if (channel >= kMaxAnalogChannels) return;
+    push_analog(channel, value);
+
+    // Recorded the same way tick() records a queued push, so
+    // log_sticks_if_moved() reports an injected stick move exactly as it
+    // reports a local one. Without this the hardest-to-see source is also the
+    // one the log says nothing about - which is the combination that turns a
+    // "the network is dropping packets" investigation into a wild goose chase.
+    std::lock_guard<std::mutex> lock(g_analogMutex);
+    g_analogValue[channel] = value;
+    for (uint8_t axis = 0; axis < kStickAxes; axis++) {
+        if (kStickChannels[axis] != channel) continue;
+        g_stickPushed[axis] = value;
+        g_stickMoved = true;
+    }
+}
+
+void setSwitchNow(uint8_t index, int8_t state) {
+    if (index >= kSwitchCount) return;
+    simu::setSwitch(index, state);
+    net_link::onSwitch(index, state);
+}
+
 int switchState(int index) {
     if (index < 0 || index >= kSwitchCount) return 0;
     std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -1740,6 +1810,20 @@ Java_com_edgetx_droidui_RcRawJoystick_nativeOnRawKey(JNIEnv* env, jclass clazz, 
                                                      jboolean down) {
     (void)env;
     (void)clazz;
+    handleKeyCode(keycode, down != JNI_FALSE);
+}
+
+// Called from RcShellKeys.java, which reads the kernel's input node as the shell user
+// (through Shizuku): the same six shoulder buttons Android delivers while the UI is up,
+// and the only source for them once it is gone. The read side translates the kernel's key
+// codes into Android's, so from here on they take the identical path - and noteNodeEdge()
+// is what stops a window's own copy from acting on the same press a second time.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_RcShellKeys_nativeOnNodeKey(JNIEnv* env, jclass clazz, jint keycode,
+                                                    jboolean down) {
+    (void)env;
+    (void)clazz;
+    noteNodeEdge(keycode);
     handleKeyCode(keycode, down != JNI_FALSE);
 }
 
