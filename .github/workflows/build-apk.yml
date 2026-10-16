@@ -1,0 +1,227 @@
+# Build the EdgeTX-on-Android APK on a clean GitHub runner.
+#
+# Runs on Windows because app/build.gradle.kts's buildEdgeTxSimulator task is
+# written for it: it shells out through cmd.exe, uses the checkout's
+# .venv/Scripts/python.exe and the windows-x86_64 NDK toolchain.
+#
+# The APK is a thin host around the real EdgeTX firmware, cross-compiled into
+# libedgetx-st16mk3-simulator.so from the public fork cpp2go/edgetx_esp32. Modes:
+#
+#   source    (default) - clone the fork, apply patches/ (a small compatibility
+#                         shim, see patches/README.md), build the library and the
+#                         APK.  No local toolchain needed.
+#   prebuilt            - reuse an already-built .so (URL / old APK / repo
+#                         path edgetx-lib/ or .edgetx/) and package it with
+#                         -Pedgetx.skipBuild=true.
+#
+# Run from the Actions tab (workflow_dispatch) or `gh workflow run`.
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      edgetx_mode:
+        description: "How to obtain the simulator library"
+        type: choice
+        options: [source, prebuilt]
+        default: source
+      edgetx_repo:
+        description: "(source) EdgeTX fork to build"
+        type: string
+        default: "https://github.com/cpp2go/edgetx_esp32"
+      edgetx_ref:
+        description: "(source) Branch, tag or commit (pinned to the fork main of 2026-09-15)"
+        type: string
+        default: "793e11364f30ca39acfbc153a83da093f8e32c81"
+      sim_lib_url:
+        description: "(prebuilt) URL to an arm64-v8a libedgetx-st16mk3-simulator.so, or to an APK to extract it from"
+        type: string
+        default: ""
+      dji_msdk:
+        description: "Package the DJI Mobile SDK (needed for the RC Plus 2 5-way switch)"
+        type: boolean
+        default: false
+      dji_app_key:
+        description: "(dji_msdk) App Key from developer.dji.com, bound to com.edgetx.droidui + the signing certificate"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 300
+    env:
+      NDK_VERSION: "28.2.13676358"
+      CMAKE_VERSION: "3.22.1"
+      BUILD_TOOLS: "36.1"
+      PLATFORM: "android-36"
+      ANDROID_SDK_ROOT: "${{ github.workspace }}/android-sdk"
+      ANDROID_HOME: "${{ github.workspace }}/android-sdk"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Python 3.11
+        if: ${{ inputs.edgetx_mode == 'source' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Android command-line tools
+        shell: pwsh
+        run: |
+          $sdk = $env:ANDROID_SDK_ROOT
+          New-Item -ItemType Directory -Force -Path "$sdk\cmdline-tools" | Out-Null
+          $zip = "$env:RUNNER_TEMP\clt.zip"
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\clt" -Force
+          Move-Item "$env:RUNNER_TEMP\clt\cmdline-tools" "$sdk\cmdline-tools\latest"
+          echo "$sdk\cmdline-tools\latest\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install SDK packages (platform, build-tools, NDK, CMake)
+        shell: pwsh
+        run: |
+          $sm = "$env:ANDROID_SDK_ROOT\cmdline-tools\latest\bin\sdkmanager.bat"
+          for ($i = 0; $i -lt 50; $i++) { "y" } | & $sm --licenses | Out-Null
+          & $sm "platform-tools" "platforms;$env:PLATFORM" "build-tools;$env:BUILD_TOOLS" "ndk;$env:NDK_VERSION" "cmake;$env:CMAKE_VERSION"
+
+      - name: Write local.properties
+        shell: pwsh
+        run: |
+          $sdk = $env:ANDROID_SDK_ROOT -replace '\\','/'
+          "sdk.dir=$sdk" | Out-File -FilePath local.properties -Encoding ascii
+
+      # ------------------------------------------------------------------
+      # The simulated SD card (app/src/main/assets/sdcard) is ~920 small stock
+      # EdgeTX 2.12 files; it is deliberately not tracked in this repository.
+      # It is taken from the upstream app this tree derives from, pinned to the
+      # commit whose copy matches it. Skipped if the files are already there.
+      # ------------------------------------------------------------------
+      - name: Fetch the simulated SD card
+        shell: pwsh
+        run: |
+          $stamp = "app\src\main\assets\sdcard\edgetx.sdcard.version"
+          if (Test-Path $stamp) {
+            Write-Host "simulated SD card already present: $(Get-Content $stamp)"
+            exit 0
+          }
+          $ref = "8de786bf50d2fe451a9d87c28b71980ff7a50b23"
+          $tgz = "$env:RUNNER_TEMP\app-src.tar.gz"
+          Invoke-WebRequest -Uri "https://codeload.github.com/cpp2go/edgetx_apk/tar.gz/$ref" -OutFile $tgz
+          $ex  = "$env:RUNNER_TEMP\app-src"
+          New-Item -ItemType Directory -Force -Path $ex | Out-Null
+          tar -xzf $tgz -C $ex
+          $top = Get-ChildItem $ex -Directory | Select-Object -First 1
+          $from = Join-Path $top.FullName "app\src\main\assets\sdcard"
+          if (-not (Test-Path $from)) { Write-Error "no $from in the upstream tarball" }
+          New-Item -ItemType Directory -Force -Path "app\src\main\assets" | Out-Null
+          Copy-Item $from "app\src\main\assets\sdcard" -Recurse -Force
+          $n = (Get-ChildItem "app\src\main\assets\sdcard" -Recurse -File).Count
+          Write-Host "simulated SD card: $n file(s), version $(Get-Content $stamp)"
+          if ($n -lt 900) { Write-Error "only $n files copied - upstream layout changed?" }
+
+      # ------------------------------------------------------------------
+      # source mode: the public EdgeTX fork + the compatibility shim
+      # ------------------------------------------------------------------
+      - name: Check out the EdgeTX fork
+        if: ${{ inputs.edgetx_mode == 'source' }}
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git clone --recursive "${{ inputs.edgetx_repo }}" edgetx
+          git -C edgetx checkout "${{ inputs.edgetx_ref }}"
+          git -C edgetx submodule update --init --recursive
+
+      - name: Create the EdgeTX Python virtualenv
+        if: ${{ inputs.edgetx_mode == 'source' }}
+        shell: pwsh
+        run: |
+          python -m venv edgetx\.venv
+          edgetx\.venv\Scripts\python.exe -m pip install --upgrade pip
+          edgetx\.venv\Scripts\python.exe -m pip install pydantic clang
+
+      - name: Apply the Android host patch
+        if: ${{ inputs.edgetx_mode == 'source' }}
+        shell: pwsh
+        run: python patches\apply.py edgetx
+
+      # ------------------------------------------------------------------
+      # prebuilt mode: fetch/extract libedgetx-st16mk3-simulator.so
+      # ------------------------------------------------------------------
+      - name: Stage prebuilt simulator library (from URL)
+        if: ${{ inputs.edgetx_mode == 'prebuilt' && inputs.sim_lib_url != '' }}
+        shell: pwsh
+        run: |
+          $out = "app\build\edgetx-libs\arm64-v8a"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $dst = "$out\libedgetx-st16mk3-simulator.so"
+          $dl  = "$env:RUNNER_TEMP\simlib.bin"
+          Invoke-WebRequest -Uri "${{ inputs.sim_lib_url }}" -OutFile $dl
+          $magic = [System.IO.File]::ReadAllBytes($dl)[0..1]
+          if ($magic[0] -eq 0x50 -and $magic[1] -eq 0x4B) {
+            # PK -> it is an APK (zip); pull the library out of it.
+            Unblock-File $dl
+            Expand-Archive -Path $dl -DestinationPath "$env:RUNNER_TEMP\apkex" -Force
+            Copy-Item "$env:RUNNER_TEMP\apkex\lib\arm64-v8a\libedgetx-st16mk3-simulator.so" $dst -Force
+          } else {
+            Copy-Item $dl $dst -Force
+          }
+          Get-Item $dst | Format-List Length,FullName
+
+      - name: Stage the committed simulator library (prebuilt fallback)
+        if: ${{ inputs.edgetx_mode == 'prebuilt' && inputs.sim_lib_url == '' }}
+        shell: pwsh
+        run: |
+          # The GitHub web uploader silently drops hidden (dot-prefixed) entries, so
+          # the library normally lives in the visible edgetx-lib/ instead of .edgetx/.
+          $candidates = @(
+            "edgetx-lib\libedgetx-st16mk3-simulator.so",
+            "edgetx-lib\libedgetx-st16mk3-simulator.so.txt",
+            ".edgetx\libedgetx-st16mk3-simulator.so"
+          )
+          $src = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $src) {
+            Write-Error "prebuilt mode needs a library: put libedgetx-st16mk3-simulator.so in edgetx-lib\, or set sim_lib_url (see BUILD_APK_CI.md)."
+          }
+          New-Item -ItemType Directory -Force -Path "app\build\edgetx-libs\arm64-v8a" | Out-Null
+          Copy-Item $src "app\build\edgetx-libs\arm64-v8a\libedgetx-st16mk3-simulator.so" -Force
+          Get-Item "app\build\edgetx-libs\arm64-v8a\libedgetx-st16mk3-simulator.so" | Format-List Length,FullName
+
+      - name: Build APK
+        shell: pwsh
+        run: |
+          $gradleArgs = @()
+          if ("${{ inputs.edgetx_mode }}" -eq "prebuilt") {
+            $gradleArgs += "-Pedgetx.skipBuild=true"
+          } else {
+            $dir = ("$env:GITHUB_WORKSPACE\edgetx" -replace '\\','/')
+            $gradleArgs += "-Pedgetx.dir=$dir"
+          }
+          if ("${{ inputs.dji_msdk }}" -eq "true") { $gradleArgs += "-Pdji.msdk=true" }
+          if ("${{ inputs.dji_app_key }}" -ne "") { $gradleArgs += "-Pdji.appKey=${{ inputs.dji_app_key }}" }
+          & .\gradlew.bat --no-daemon :app:assembleRelease @gradleArgs
+
+      # The DJI App Key is bound to the package name *and* the signing
+      # certificate, so print the fingerprint that developer.dji.com must be
+      # given. The release APK is signed with the debug keystore
+      # (app/build.gradle.kts), whose Android Debug certificate is stable.
+      - name: Print the APK signing certificate (for the DJI App Key)
+        if: ${{ inputs.dji_msdk }}
+        shell: pwsh
+        run: keytool -printcert -jarfile app\build\outputs\apk\release\app-release.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: edgetx-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
