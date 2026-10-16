@@ -6,6 +6,7 @@ import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.lang.reflect.Method;
 
 import rikka.shizuku.Shizuku;
 
@@ -20,9 +21,10 @@ import rikka.shizuku.Shizuku;
  *
  * <p>The node is {@code root:input 0660} and no app permission grants the
  * {@code input} group, but the {@code shell} user is in it - measured on the RC Plus 2
- * ({@code groups=...,1004(input)}). Shizuku is a running shell-uid server, so
- * {@link Shizuku#newProcess} is the one route to that node that needs no root: this
- * class runs {@code cat /dev/input/event3} as that shell and parses the event stream.
+ * ({@code groups=...,1004(input)}). Shizuku is a running shell-uid server, so running one
+ * command as that shell is the only route to the node that needs no root: this class runs
+ * {@code cat /dev/input/event3} as that shell and parses the event stream (see
+ * {@link #newShellProcess}).
  *
  * <p><b>The node</b> is the remote's {@code gpio-keys} device. It declares exactly
  * seven key codes, of which the first six are the shoulders:
@@ -175,7 +177,7 @@ final class RcShellKeys {
         while (true) {
             Process process = null;
             try {
-                process = Shizuku.newProcess(new String[]{"cat", NODE}, null, null);
+                process = newShellProcess(new String[]{"cat", NODE});
                 sProcess = process;
                 Log.i(TAG, "shizuku: reading the shoulder buttons from " + NODE);
 
@@ -207,6 +209,21 @@ final class RcShellKeys {
                 return;
             }
         }
+    }
+
+    /**
+     * Runs one command as the shell user. {@code Shizuku.newProcess} is the only route to
+     * that which does not mean binding a user service, but it is private in API 13: it was
+     * public in 12 and is scheduled to disappear in 14, and 13.1.5 is what build.gradle.kts
+     * pins. It is a plain private method of a class inside this APK, not a hidden platform
+     * API, so reflection reaches it - and if Shizuku ever drops it, this throws and the
+     * reader retries, which is the same as Shizuku not being there.
+     */
+    private static Process newShellProcess(String[] command) throws Exception {
+        final Method newProcess = Shizuku.class.getDeclaredMethod("newProcess",
+                String[].class, String[].class, String.class);
+        newProcess.setAccessible(true);
+        return (Process) newProcess.invoke(null, command, null, null);
     }
 
     /** Feeds every key edge in the stream to the firmware, one 24-byte record at a time. */

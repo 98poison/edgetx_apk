@@ -107,6 +107,9 @@ android {
         if (releaseKeystore.isFile) {
             create("release") {
                 storeFile = releaseKeystore
+                // keytool writes PKCS12 by default from JDK 9 on, and apksig only falls
+                // back to it when the type is not given - saying so removes the guess.
+                storeType = "PKCS12"
                 storePassword = releaseKeystorePassword
                 keyAlias = releaseKeystoreAlias
                 keyPassword = releaseKeystorePassword
