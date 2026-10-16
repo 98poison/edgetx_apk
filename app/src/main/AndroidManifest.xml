@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  EdgeTX UI - pure native app.
+  The launcher activity is Android's own android.app.NativeActivity.
+  All logic (LVGL rendering, Lua runtime, EdgeTX Lua API) lives in libedgetx_ui.so.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Needed by the optional DJI Mobile SDK build (see app/build.gradle.kts).
+         Unused when dji.msdk is off. Enabling MSDK will additionally require its
+         full permission set (location, storage, bluetooth, ...). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- The remote controller's own GPS, which is what EdgeTX's own position (gpsData) is filled
+         from - see RcGps. A runtime permission, asked for by EdgeTxActivity; without it the
+         firmware simply shows no fix. The RF link's telemetry GPS does not need any of this. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- RcDpadLog: the remote's own key handler writes every button it handles to logcat,
+         and on the RC Pro that is the only reliable source for the pause, landing, C1 and
+         C2 buttons (the DJI SDK sets its whole key set to null in waves and loses presses
+         made during one).
+
+         READ_LOGS is signature-level, so it is NOT granted by the installer: the app runs
+         fine without it, and only those buttons are missing. To turn it on, once per remote:
+
+             adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS
+
+         Without the declaration above that grant fails with "has not requested permission",
+         which is why the permission is always in the manifest even though nothing else needs
+         it. Nothing is read from the log except the lines RcDpadLog parses. -->
+    <uses-permission android:name="android.permission.READ_LOGS" />
+    <!-- Best-effort stop of DJI Fly while the EdgeTX link service is active (ground use only). -->
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+
+    <!-- The RF module is attached to the RC's USB port as a USB serial
+         device (see RcModuleSerial.java). Not required: the app is fully usable
+         without a module, it just has no transmitter behind it. -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <!-- RcLinkService: keeps the firmware (and therefore the frames reaching the
+         RF module) running after the UI is gone.
+
+         FOREGROUND_SERVICE_CONNECTED_DEVICE and FOREGROUND_SERVICE_SPECIAL_USE
+         are the two types that service tries, in that order; see
+         RcLinkService.promoteToForeground(). WAKE_LOCK lets it keep streaming
+         with the screen off, POST_NOTIFICATIONS only affects whether the ongoing
+         notification is visible on Android 13 and later. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- The vibration motor, for EdgeTX's haptics: normal permission, granted at install. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The simulated SD card lives in /storage/emulated/0/EdgeTX, where the models,
+         sounds and radio.yml can be edited with a file manager. On Android 11+ writing
+         there needs "All files access", which the user grants once in system settings;
+         without it the card stays in the app's own directory (see prepare_sd_root). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <!-- Android 10 has no "All files access" at all (MANAGE_EXTERNAL_STORAGE starts at
+         API 30), and the RC Pro is Android 10: there the same card is written with the
+         legacy permission instead, which is why it is declared for API 29 and below only.
+         requestLegacyExternalStorage on the application is the other half: an app
+         targeting 30+ is otherwise put into scoped storage on Android 10 as well, and
+         "/storage/emulated/0/EdgeTX" would not be writable even with this permission. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+
+    <application
+        android:name=".EdgeTxApplication"
+        android:label="EdgeTX"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:requestLegacyExternalStorage="true"
+        android:supportsRtl="false">
+
+        <!-- DJI Mobile SDK App Key. Empty unless dji.appKey is set in
+             local.properties (SDKManager.registerApp() reads it from here). -->
+        <meta-data
+            android:name="com.dji.sdk.API_KEY"
+            android:value="${djiAppKey}" />
+
+        <!-- EdgeTxActivity is NativeActivity with onCreate added: it asks for
+             WRITE_EXTERNAL_STORAGE on Android 10, where there is no "All files access" and the
+             card would otherwise land where no file manager can reach it. The native app runs
+             from NativeActivity exactly as before, which is what the meta-data below needs. -->
+        <activity
+            android:name=".EdgeTxActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+            <!-- Native library name = libedgetx_ui.so -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="edgetx_ui" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Carries res/xml/usb_device_filter.xml, which is what makes Android treat this
+             app as the RC joystick's own app so the USB permission dialog offers "use for
+             this device by default" and stops asking again after every boot.
+
+             The device is internal and present from boot, so the system may start this at
+             any time: it shows nothing, does nothing, and its own process is left empty
+             on purpose (see UsbAttachActivity and EdgeTxApplication). -->
+        <activity
+            android:name=".UsbAttachActivity"
+            android:process=":usbattach"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </activity>
+
+        <!-- Outlives the activity on purpose: `stopWithTask=false` means removing
+             the task from recents does not stop it, so the firmware keeps feeding
+             the RF module. Started from EdgeTxApplication.
+
+             Both foreground service types are declared because the runtime picks
+             connectedDevice when the platform accepts it and falls back to
+             specialUse; the property below is the mandatory subtype label for
+             specialUse (Android 14+). -->
+        <service
+            android:name=".RcLinkService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="connectedDevice|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps an EdgeTX transmitter link to an RF module on a USB serial port" />
+        </service>
+    </application>
+
+</manifest>
