@@ -116,8 +116,12 @@ constexpr uint8_t kSwH = 7;   // R2
 constexpr uint8_t kSwI = 8;   // R3
 constexpr uint8_t kSwJ = 9;   // C4
 
-// EdgeTX keys (radio/src/hal/key_driver.h EnumKeys).
+// EdgeTX keys (radio/src/hal/key_driver.h EnumKeys). joystick.cpp numbers the
+// same keys the same way, but its constants are file-local (constexpr), so the
+// ones used here have to be repeated.
 constexpr uint8_t kKeyExit = 1;
+constexpr uint8_t kKeyPageUp = 3;
+constexpr uint8_t kKeyPageDn = 4;
 constexpr uint8_t kKeySys = 13;
 constexpr uint8_t kKeyModel = 11;
 constexpr uint8_t kKeyTele = 12;
@@ -232,8 +236,7 @@ void applyFiveWay(uint8_t now, uint8_t prev)
         LOGI("bridge: 5-way left -> PAGEUP");
     }
     if (rising & kPadRight) {
-        // PAGEDOWN is key 4 on this target; joystick.cpp's kKeyPageDn.
-        joystick::requestKey(4, 60);
+        joystick::requestKey(kKeyPageDn, 60);
         LOGI("bridge: 5-way right -> PAGEDOWN");
     }
     if (rising & kPadCentre) {
@@ -375,6 +378,10 @@ bool take(Mailbox* out)
 }
 
 // ------------------------------------------------------------ packet ----
+
+// Declared here, defined in the "analog" section further down: apply() calls it
+// from line 386 on, and C++ wants the declaration before the first call.
+uint16_t toAnalog(int16_t v);
 
 // Applies one mailbox snapshot to the firmware. Runs on the link thread only.
 void apply(const Mailbox& m)
