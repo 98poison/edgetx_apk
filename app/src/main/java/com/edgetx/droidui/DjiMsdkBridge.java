@@ -238,6 +238,7 @@ public final class DjiMsdkBridge {
             listen();
             return;
         }
+        logAppIdentity(app);
         SDKManager.getInstance().init(app, new SDKManagerCallback() {
             @Override public void onRegisterSuccess() {
                 Log.i(TAG, "dji: register success");
@@ -268,6 +269,99 @@ public final class DjiMsdkBridge {
 
             @Override public void onDatabaseDownloadProgress(long current, long total) { }
         });
+    }
+
+    /**
+     * Prints the three values DJI checks an App Key against, before registration is even
+     * attempted.
+     *
+     * <p>A key from developer.dji.com is issued against one package name and one signing
+     * certificate. {@code registerApp()} sends both and the server compares them, so a
+     * mismatch is reported as an opaque {@code IDJIError} that names neither. When the
+     * buttons that need registration are quiet - go-home above all - this line is the
+     * difference between "the key is wrong" and "the key is right and something else is".
+     *
+     * <p>Kept deliberately cheap and safe: a certificate can be absent on some builds, and
+     * none of this is allowed to throw on the way into init().
+     */
+    private static void logAppIdentity(Context app) {
+        String name = "?";
+        String sha1 = "no signature";
+        String key = "(unset)";
+        try {
+            name = app.getPackageName();
+        } catch (Throwable ignored) {
+        }
+        try {
+            final android.content.pm.PackageManager pm = app.getPackageManager();
+            final android.content.pm.Signature[] sigs = signatureOf(pm, name);
+            if (sigs != null && sigs.length > 0) {
+                sha1 = fingerprint(sigs[0]);
+            }
+        } catch (Throwable t) {
+            sha1 = "unreadable (" + t.getClass().getSimpleName() + ")";
+        }
+        try {
+            final String meta = "com.dji.sdk.API_KEY";
+            final android.content.pm.ApplicationInfo ai =
+                    app.getPackageManager().getApplicationInfo(name,
+                            android.content.pm.PackageManager.GET_META_DATA);
+            final String v = ai.metaData == null ? null : ai.metaData.getString(meta);
+            key = (v == null || v.isEmpty()) ? "(empty)" : v;
+        } catch (Throwable t) {
+            key = "unreadable";
+        }
+        Log.i(TAG, "dji: app key " + key + " / package " + name + " / cert SHA1 " + sha1);
+        Log.i(TAG, "dji: developer.dji.com must list exactly that package and that SHA1, "
+                + "or registerApp() fails and every key that needs registration stays silent");
+    }
+
+    /**
+     * The SHA-1 fingerprint of a signing certificate, in the colon-separated upper case form
+     * developer.dji.com shows.
+     *
+     * <p>{@code Signature.toByteArray()} hands back the whole DER certificate - about 500
+     * bytes - so printing it directly looks like a fingerprint and is not one. It has to be
+     * hashed, and this is the hash: the one line of output that can be compared with the
+     * console without any further work.
+     */
+    private static String fingerprint(android.content.pm.Signature sig) throws Exception {
+        final byte[] der = sig.toByteArray();
+        final byte[] digest = java.security.MessageDigest.getInstance("SHA-1").digest(der);
+        final StringBuilder hex = new StringBuilder(digest.length * 3);
+        for (byte b : digest) {
+            if (hex.length() > 0) {
+                hex.append(':');
+            }
+            hex.append(String.format("%02X", b & 0xFF));
+        }
+        return hex.toString();
+    }
+
+    /**
+     * The signatures this build is installed under, across both storage APIs.
+     *
+     * <p>{@code GET_SIGNATURES} was deprecated in API 28 and returns null on a device that
+     * new - which this one is - so the signing-info path is not a fallback here, it is the
+     * only one that returns anything. Both are kept because the APK still builds at
+     * minSdk 24, and a build old enough to run there would otherwise report no certificate
+     * at all and send you looking for a key problem that is not there.
+     */
+    @SuppressWarnings("deprecation")
+    private static android.content.pm.Signature[] signatureOf(
+            android.content.pm.PackageManager pm, String name) throws Exception {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            final android.content.pm.SigningInfo info =
+                    pm.getPackageInfo(name, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES)
+                            .signingInfo;
+            if (info != null) {
+                if (info.hasMultipleSigners()) {
+                    return info.getApkContentsSigners();
+                }
+                return info.getSigningCertificateHistory();
+            }
+        }
+        return pm.getPackageInfo(name, android.content.pm.PackageManager.GET_SIGNATURES).signatures;
     }
 
     private static void listen() {
@@ -525,7 +619,7 @@ public final class DjiMsdkBridge {
         // a different one.
         Log.i(TAG, "dji: shutter -> switch " + (char) ('A' + SLOT_PHOTO) + " "
                 + (position > 0 ? "low" : "high"));
-        nativeOnDjiSwitch(SLOT_PHOTO, position);
+        dispatchSwitchToFirmware(SLOT_PHOTO, position);
     }
 
     /**
@@ -575,7 +669,7 @@ public final class DjiMsdkBridge {
 
             // This slot latches, so a restart brings back the position of the last press; the
             // middle position is where it sits until the first one.
-            nativeOnDjiSwitch(SLOT_PHOTO, sShutterPosition);
+            dispatchSwitchToFirmware(SLOT_PHOTO, sShutterPosition);
         } catch (Throwable t) {
             Log.w(TAG, "dji: shutter listen failed", t);
         }
@@ -638,7 +732,7 @@ public final class DjiMsdkBridge {
                             Log.i(TAG, "dji: " + name + " -> switch " + (char) ('A' + index)
                                     + " position " + position);
                             try {
-                                nativeOnDjiSwitch(index, position);
+                                dispatchSwitchToFirmware(index, position);
                             } catch (Throwable t) {
                                 Log.w(TAG, "dji: switch " + index + " dispatch failed", t);
                             }
@@ -1053,6 +1147,32 @@ public final class DjiMsdkBridge {
         dispatchToggle(index, high);
     }
 
+    /**
+     * The one place this app is allowed to push an EdgeTX switch, and it stands down
+     * when rcbridge is driving them.
+     *
+     * <p>Everything below funnels through here rather than calling nativeOnDjiSwitch
+     * directly, because the decision has to be made in exactly one place: six call
+     * sites writing the same ten slots is how SA ended up carrying both "takeoff"
+     * and "go-home" at once.
+     *
+     * <p>Returns whether it wrote, so callers that log can tell the difference
+     * between "the switch moved" and "rcbridge owns it now" rather than both
+     * reading as success.
+     */
+    private static boolean dispatchSwitchToFirmware(int index, int state) {
+        if (RcBridgeClient.bridgeFeedsUs()) {
+            return false;
+        }
+        try {
+            nativeOnDjiSwitch(index, state);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: switch " + index + " dispatch failed", t);
+            return false;
+        }
+    }
+
     private static void dispatchToggle(int index, boolean high) {
         if (index == SW_SA) {
             persistSwitch(PREF_TAKEOFF, high ? SWITCH_HIGH : SWITCH_LOW);
@@ -1063,7 +1183,7 @@ public final class DjiMsdkBridge {
         }
 
         try {
-            nativeOnDjiSwitch(index, high ? SWITCH_HIGH : SWITCH_LOW);
+            dispatchSwitchToFirmware(index, high ? SWITCH_HIGH : SWITCH_LOW);
         } catch (Throwable t) {
             Log.w(TAG, "dji: switch " + index + " dispatch failed", t);
         }
@@ -1235,7 +1355,7 @@ public final class DjiMsdkBridge {
                             // button, but it is a real lamp, so it follows the arm state.
                             RcLed.setColor(newValue ? RcLed.GREEN : RcLed.RED);
                             try {
-                                nativeOnDjiSwitch(SW_SJ, newValue ? 1 : -1);
+                                dispatchSwitchToFirmware(SW_SJ, newValue ? 1 : -1);
                             } catch (Throwable t) {
                                 Log.w(TAG, "dji: arm state dispatch failed", t);
                             }
@@ -1268,7 +1388,7 @@ public final class DjiMsdkBridge {
         sLastSwitchPosition[index] = state;
         Log.i(TAG, "dji: switch " + index + " -> " + (state > 0 ? "down" : state < 0 ? "up" : "mid"));
         try {
-            nativeOnDjiSwitch(index, state);
+            dispatchSwitchToFirmware(index, state);
         } catch (Throwable t) {
             Log.w(TAG, "dji: switch dispatch failed", t);
         }

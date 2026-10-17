@@ -2,12 +2,17 @@ package com.edgetx.droidui;
 
 import android.Manifest;
 import android.app.NativeActivity;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.Button;
 import android.widget.Toast;
 
 /**
@@ -40,6 +45,16 @@ public class EdgeTxActivity extends NativeActivity {
 
     /** Both runtime permissions this app asks for go through this one request. */
     private static final int REQUEST_PERMISSIONS = 1;
+
+    /**
+     * Id of the bridge button, so it is added once even though onCreate can run
+     * again after a configuration change.
+     *
+     * <p>A made-up id in the app's own range, not a resource one: the project has
+     * no layout resources and adding a first one for a single button would be a
+     * larger change than the button.
+     */
+    private static final int BRIDGE_BUTTON_ID = 0x0B71D6;
 
     /** How often to put the USB dialog back up while the permission is missing. */
     private static final long USB_ASK_MS = 8000;
@@ -93,10 +108,15 @@ public class EdgeTxActivity extends NativeActivity {
         EdgeTxApplication.startFromActivity(this);
         super.onCreate(savedInstanceState);
 
-        // The settings gear: a disc drawn over the firmware's screen that opens the
-        // network-forwarding settings, so the destination address can be changed on the radio
-        // instead of by pushing netlink.conf over adb. Nothing about the app depends on it.
-        NetSettingsOverlay.attach(this);
+        // The way in to the bridge's own screen: settings and diagnostics.
+        //
+        // This was a floating gear in an overlay window, which needed the
+        // "display over other apps" permission. That permission is an appop with
+        // no runtime dialog on this remote, so it could only be granted over adb,
+        // and a user who had not run that command had a working remote and no
+        // visible way to find out what anything was configured to do. A button in
+        // this activity's own window needs nothing granted.
+        addBridgeButton();
 
         // The two runtime permissions this app has, and neither one has a settings screen that
         // would do: the storage one Android 10 needs for the simulated card (see the class note),
@@ -149,9 +169,11 @@ public class EdgeTxActivity extends NativeActivity {
         // window for the USB dialog, and the location permission for the remote's GPS.
         RcGps.start(this);
 
-        // The gear is an overlay window, so it survives this activity going away on its own -
-        // hidden here and shown again in onResume, it stays out of DJI's own screens.
-        NetSettingsOverlay.setVisible(true);
+        // The channel window, if the switch on the settings page is on. Restored rather than
+        // shown, so a switch left off stays off. Nothing takes it down when this activity
+        // pauses: it is an overlay, and the moment it is worth having is while something else
+        // is in front - see ChannelHud.
+        ChannelHud.restore(this);
 
         tellAboutMissingLogAccess();
     }
@@ -162,13 +184,135 @@ public class EdgeTxActivity extends NativeActivity {
         // A request made without a window is refused without a dialog, so do not ask while the
         // firmware is not the thing on screen; onResume starts the asking again.
         handler.removeCallbacks(usbAsk);
-        NetSettingsOverlay.setVisible(false);
+    }
+
+    /**
+     * Adds the button that opens the bridge's screen, as a child of this activity's
+     * own window.
+     *
+     * <p>Deferred rather than done in onCreate, because this activity is a
+     * NativeActivity and its native side calls setContentView() after onCreate
+     * returns. setContentView empties android.R.id/content first, so a button
+     * added in onCreate is silently removed a few milliseconds later - which looks
+     * exactly like a button that was never added, and is why the first attempt at
+     * this produced an activity with no way into it and no error anywhere.
+     *
+     * <p>onWindowFocusChanged is used rather than a posted runnable because it is
+     * the first point at which the native content is definitely in place and the
+     * window has its final size, and it fires again after a resume - so the
+     * existing check below is what keeps it from being added twice.
+     */
+    private void addBridgeButton() {
+        final android.view.ViewGroup root =
+                (android.view.ViewGroup) getWindow().getDecorView()
+                        .findViewById(android.R.id.content);
+        if (root == null || root.findViewById(BRIDGE_BUTTON_ID) != null) return;
+
+        // The firmware is drawn on a NativeSurfaceView, whose surface is
+        // composited by SurfaceFlinger rather than drawn into the window. The
+        // native side puts it on top - setZOrderOnTop - because it is the whole
+        // screen. Anything added to the view hierarchy then lands on the window's
+        // own surface, which is *underneath*, and is invisible even though it is
+        // in the tree and the log says it was added.
+        //
+        // setZOrderMediaOverlay puts the surface back below the window's, which is
+        // exactly where a full-screen SurfaceView wants to be anyway: it still
+        // covers everything, because the window is transparent where the
+        // SurfaceView's hole is punched, and Android views can now draw over it.
+        demoteSurface(root);
+
+        final Button button = new Button(this);
+        button.setText("⚙ 桥接");
+        button.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        button.setAlpha(0.72f);
+        button.setPadding(dp(8), dp(4), dp(8), dp(4));
+        button.setBackgroundColor(0xB0000000);
+        button.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                try {
+                    startActivity(new Intent(EdgeTxActivity.this, BridgeActivity.class));
+                } catch (Throwable t) {
+                    Log.w(TAG, "could not open the bridge screen", t);
+                    Toast.makeText(EdgeTxActivity.this, "打不开桥接页面",
+                            Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+
+        final android.widget.FrameLayout.LayoutParams lp =
+                new android.widget.FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        android.view.Gravity.TOP | android.view.Gravity.END);
+        lp.topMargin = dp(12);
+        lp.rightMargin = dp(60);
+        root.addView(button, lp);
+        button.setId(BRIDGE_BUTTON_ID);
+        Log.i(TAG, "bridge: the settings button is up");
     }
 
     @Override
-    protected void onDestroy() {
-        NetSettingsOverlay.detach();
-        super.onDestroy();
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            addBridgeButton();
+        }
+    }
+
+    /**
+ * Takes the firmware's surface out from on top of the window.
+ *
+ * <p>Walks the tree because the surface view is created by the native side and
+ * put somewhere we do not control - looking it up by name or by position would
+ * both be a guess that breaks the next time the native side changes shape.
+ *
+ * <p>Only touches views that have it set already. Calling it unconditionally
+ * would be harmless in itself but would move the surface on a build that had it
+ * right, and "it used to work" is worth preserving rather than re-establishing on
+ * every launch.
+ *
+ * <p>setZOrderOnTop is read back reflectively because getZOrderOnTop is hidden
+ * API and the app has no business calling it. If the read fails the surface is
+ * demoted anyway: the cost of doing it to a surface that was already below is
+ * nothing visible, whereas guessing wrong about a surface that was above leaves
+ * the button invisible.
+ */
+private void demoteSurface(ViewGroup root) {
+        for (int i = 0; i < root.getChildCount(); i++) {
+            final View child = root.getChildAt(i);
+            if (child instanceof android.view.SurfaceView) {
+                final android.view.SurfaceView sv = (android.view.SurfaceView) child;
+                if (surfaceIsOnTop(sv)) {
+                    sv.setZOrderOnTop(false);
+                    sv.setZOrderMediaOverlay(true);
+                    Log.i(TAG, "bridge: the firmware's surface was on top; moved it below "
+                            + "so this activity's own views are visible");
+                }
+                continue;
+            }
+            if (child instanceof ViewGroup) {
+                demoteSurface((ViewGroup) child);
+            }
+        }
+    }
+
+    /** Whether this surface asked to be above the window. False if it cannot be asked. */
+    private boolean surfaceIsOnTop(android.view.SurfaceView sv) {
+        try {
+            final java.lang.reflect.Method m =
+                    android.view.SurfaceView.class.getMethod("getZOrderOnTop");
+            return Boolean.TRUE.equals(m.invoke(sv));
+        } catch (Throwable t) {
+            // Hidden API unavailable: assume it is on top and demote it. That is
+            // the state this whole method exists to undo, so erring towards it is
+            // the safe direction.
+            return true;
+        }
+    }
+
+    private int dp(int value) {
+        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
 
     /**

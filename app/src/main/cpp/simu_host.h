@@ -172,6 +172,21 @@ uint16_t anaIn(uint8_t chan);
 // 0 = up, 1 = middle, 2 = down. Weak like the others, so an older library still loads.
 uint32_t switchState(uint8_t pos_idx) __attribute__((weak));
 
+// The *mixed* channel outputs - what the RF module is fed, after the mixer, the
+// limits and the trims. This is the only place the app can see them: the
+// firmware owns the mix and never hands the result to the host except through
+// its own driver. Copies min(count, 32) of the firmware's int16 channels into
+// `outputs` and returns how many it wrote.
+//
+// Values are the raw mixer units, +-1024 for full deflection (so /10.24 gives
+// percent, centred on 0), which is the same scale the channel monitor in the
+// firmware shows.
+//
+// Not weak, and not extern "C": it is a C++ function in the library, so the
+// linker finds it by name, and a library without it must fail the build rather
+// than silently report 0 for every channel.
+int simuCopyChannelOutputs(int16_t* outputs, unsigned char count);
+
 namespace simu {
 
 // ---------------------------------------------------------------- host API --

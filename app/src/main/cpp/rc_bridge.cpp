@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstddef>
 #include <cstring>
@@ -114,6 +115,11 @@ enum : uint64_t {
     kBtnR2 = 1ull << 12,
     kBtnR3 = 1ull << 13,
     kBtnRTN = 1ull << 14,
+    // The round lit button on the front, labelled takeoff. It had no bit: the
+    // DJI SDK reports it and the app drove a switch from it directly, so it
+    // never reached this table. Mirrors Proto.kt's Btn.TAKEOFF and proto.go's
+    // BtnTakeoff - all three are separate implementations of one format.
+    kBtnTakeoff = 1ull << 15,
 };
 
 // 5-way bits.
@@ -144,12 +150,12 @@ constexpr uint8_t kSwJ = 9;   // C4
 // EdgeTX keys (radio/src/hal/key_driver.h EnumKeys). joystick.cpp numbers the
 // same keys the same way, but its constants are file-local (constexpr), so the
 // ones used here have to be repeated.
+//
+// SYS (13), MDL (11) and TELE (12) are deliberately absent. L1/L2/L3 were bound
+// to them and are now MAVLink channel 15 on their own; see applyButtons.
 constexpr uint8_t kKeyExit = 1;
 constexpr uint8_t kKeyPageUp = 3;
 constexpr uint8_t kKeyPageDn = 4;
-constexpr uint8_t kKeySys = 13;
-constexpr uint8_t kKeyModel = 11;
-constexpr uint8_t kKeyTele = 12;
 
 // The two dials, on the board's pot inputs (simu_host.h: 4 = P1, 5 = P2), which
 // is what a radio normally drives its pots from - volume and backlight through
@@ -338,22 +344,29 @@ void applyButtons(uint64_t now, uint64_t prev)
         }
     }
 
-    // --- L1/L2/L3 and RTN: EdgeTX keys -----------------------------------
+    // --- RTN: an EdgeTX key ------------------------------------------------
     //
-    // Keys rather than switches, so a single press opens the setup, model or
-    // telemetry page - which is what a hardware TX16S does with its SYS/MDL/TELE
-    // buttons, and the RC Plus 2 does not have. Putting them where a pilot
-    // expects them is worth a switch slot each.
+    // Only RTN. L1, L2 and L3 used to be here as SYS, MDL and TELE, which is what
+    // a hardware TX16S does with those three buttons and what the RC Plus 2 does
+    // not have - and it conflicted with their channel. They carry MAVLink CH15 as
+    // a three-position switch, so one press both threw the channel and navigated
+    // the firmware to a settings page, with no way to have one without the other.
+    // The channel is what a pilot wants while flying; the page change is a
+    // surprise. So the keys are gone and CH15 has them to itself.
+    //
+    // To get navigation back: put them on switches instead of keys, which is what
+    // a logical switch in the model is for - the firmware will not jump a page on
+    // its own, and the pilot decides when.
     struct KeyBit { uint64_t bit; uint8_t key; uint32_t hold; const char* name; };
     const KeyBit keys[] = {
-        {kBtnL1, kKeySys, 60, "L1"},
-        {kBtnL2, kKeyModel, 60, "L2"},
-        {kBtnL3, kKeyTele, 60, "L3"},
         // RTN is given a long hold so EdgeTX's own long press fires. The RC's
         // return button arrives as an 8 ms tap however long it is held (see
         // joystick.cpp), so without this the long-press gestures - closing a page
         // group, stopping a Lua script - cannot be reached from it at all.
-        {kBtnRTN, kKeyExit, 320, "RTN"},
+        // RTN is back here, where it belongs. It was pulled out while the readout shared
+    // the button and needed the EXIT to be deferred; with the gesture on C1 there
+    // is nothing to defer and a press can go straight to the firmware again.
+    {kBtnRTN, kKeyExit, 320, "RTN"},
     };
     for (const KeyBit& k : keys) {
         if ((rising & k.bit) != 0) {
@@ -380,6 +393,38 @@ struct Mailbox {
 
 std::mutex g_mailboxMutex;
 Mailbox g_mailbox;
+
+/**
+ * The snapshot the readout reads.
+ *
+ * The state above it is link-thread-only by design - the socket thread decodes
+ * into the mailbox and the link thread applies, so nothing below the mailbox
+ * needs a lock. Adding a reader on the Java UI thread broke that assumption: it
+ * would be the third thread in the module, reading the same variables with no
+ * lock and no atomicity, and could be handed half of one packet's sticks and half
+ * of the next.
+ *
+ * A per-read lock would work but would be the wrong shape: these are read ten
+ * times a second by a view, not synchronised against anything. So the link
+ * thread publishes a copy, once, after it has finished applying, and the UI
+ * thread reads only the copy. That also makes the snapshot internally
+ * consistent, which the direct read did not guarantee - the four sticks in one
+ * row were previously four independent loads and could straddle two packets.
+ */
+struct StatusSnapshot {
+    int16_t sticks[4] = {0, 0, 0, 0};
+    int16_t dials[2] = {0, 0};
+    uint8_t five = 0;
+    int8_t fmode = 0;
+    uint64_t buttons = 0;
+    int8_t switches[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint64_t axesPushes = 0;
+    uint64_t accepted = 0;
+    bool seenButtons = false;
+};
+
+std::mutex g_statusMutex;
+StatusSnapshot g_status;
 
 void deposit(const Packet& p)
 {
@@ -415,6 +460,7 @@ bool take(Mailbox* out)
 // from line 386 on, and C++ wants the declaration before the first call.
 uint16_t toAnalog(int16_t v);
 
+// ---------------------------------------------------------- applying ---
 // Applies one mailbox snapshot to the firmware. Runs on the link thread only.
 void apply(const Mailbox& m)
 {
@@ -490,19 +536,48 @@ uint16_t toAnalog(int16_t v)
 
 // --------------------------------------------------------------- net ----
 
+// The address of whoever sent the last packet, so the acknowledgement can go
+// back to them.
+//
+// Kept under its own mutex because it is written on the receive thread and read
+// on the same one - sendAck is only ever called from receiveLoop - but the type
+// is trivially copyable and the lock costs nothing measurable at 100 packets a
+// second.
+std::mutex g_peerMutex;
+sockaddr_in g_peer{};
+bool g_peerKnown = false;
+
 void sendAck(uint32_t seq)
 {
     const int fd = g_sock.load(std::memory_order_relaxed);
     if (fd < 0) return;
+
     uint8_t ack[8] = {'A', 'C', 'K', '1', 0, 0, 0, 0};
     ack[4] = static_cast<uint8_t>(seq & 0xFF);
     ack[5] = static_cast<uint8_t>((seq >> 8) & 0xFF);
     ack[6] = static_cast<uint8_t>((seq >> 16) & 0xFF);
     ack[7] = static_cast<uint8_t>((seq >> 24) & 0xFF);
-    ::send(fd, ack, sizeof(ack), 0);
-    // Sent back to whoever sent the packet, which is what rcbridge's unverified
-    // UDP needs: without an answer, a stopped collector and a working one look
-    // identical from rcbridge's side.
+
+    sockaddr_in peer{};
+    socklen_t peerLen = sizeof(peer);
+    {
+        std::lock_guard<std::mutex> lock(g_peerMutex);
+        if (!g_peerKnown) return;
+        peer = g_peer;
+        peerLen = sizeof(peer);
+    }
+
+    // sendto(), not send().
+    //
+    // This socket is bound but never connected, because it has to accept packets
+    // from anywhere - rcbridge may be on another machine. An unconnected UDP
+    // socket has no default peer, so send() fails with EDESTADDRREQ and not one
+    // byte leaves the machine. The symptom is not a crash: the app reports every
+    // packet as received and accepted, and rcbridge reports "the EdgeTX app has
+    // not acknowledged anything" forever, which points at the network rather than
+    // at the one function call that is wrong.
+    ::sendto(fd, ack, sizeof(ack), 0,
+             reinterpret_cast<sockaddr*>(&peer), peerLen);
 }
 
 void receiveLoop(int fd)
@@ -522,8 +597,18 @@ void receiveLoop(int fd)
         }
         if (ready == 0) continue;   // timeout: loop and re-check g_running
 
-        const ssize_t n = recv(fd, buf.data(), buf.size(), 0);
+        // recvfrom, not recv: the acknowledgement has to go back to whoever sent
+        // this packet, and an unconnected socket learns that address only here.
+        sockaddr_in from{};
+        socklen_t fromLen = sizeof(from);
+        const ssize_t n = ::recvfrom(fd, buf.data(), buf.size(), 0,
+                                     reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n <= 0) continue;
+        {
+            std::lock_guard<std::mutex> lock(g_peerMutex);
+            g_peer = from;
+            g_peerKnown = true;
+        }
 
         // Acknowledge, then deposit. The reply goes out before the state is
         // applied, which is honest: it means "received and decoded", not "applied",
@@ -638,11 +723,110 @@ void onPacket(const uint8_t* data, uint32_t len)
     g_accepted.fetch_add(1, std::memory_order_relaxed);
 }
 
+/** Publishes the current state for the readout. Defined below; link thread only. */
+void publishStatus();
+
 void tick()
 {
     Mailbox m;
     if (!take(&m)) return;
     apply(m);
+
+    // After apply(), not inside it: apply() has early returns per flag group, and
+    // a snapshot published from inside would miss whichever group it skipped.
+    // Here the whole packet has been applied, so the copy is one consistent
+    // state rather than a mixture.
+    //
+    // Publishing per packet rather than per timer is what keeps this free. take()
+    // returns false when nothing arrived, and the common case on a quiet radio
+    // is a packet only every few milliseconds.
+    publishStatus();
+}
+
+/**
+ * Publishes the current state for the readout. Link thread only.
+ *
+ * The lock is held for a struct copy of about forty bytes, once per packet.
+ */
+void publishStatus()
+{
+    StatusSnapshot s;
+    for (int i = 0; i < 4; ++i) s.sticks[i] = g_sticks[i];
+    for (int i = 0; i < 2; ++i) s.dials[i] = g_dials[i];
+    s.five = g_five;
+    s.fmode = g_fmode;
+    s.buttons = g_buttons;
+
+    // The ten switch positions, in the same SA..SJ order as the table at the top
+    // of this file. Read from the latches, which are what the firmware was last
+    // told; the momentary switches are reported from the mask so that a held R2
+    // reads as held rather than as its last edge.
+    //
+    // The ternaries are explicit int8_t because the conditional operator's
+    // operands promote to int and narrowing int back into an int8_t array is
+    // not a constant expression.
+    s.switches[0] = g_goHome;
+    s.switches[1] = g_fmode;
+    s.switches[2] = g_record;
+    s.switches[3] = g_pause;
+    s.switches[4] = g_shutter;
+    s.switches[5] = g_cLast;   // C1/C2/C3, with "nothing yet" at 2
+    s.switches[6] = static_cast<int8_t>((g_buttons & kBtnR1) ? 1 : -1);
+    s.switches[7] = static_cast<int8_t>((g_buttons & kBtnR2) ? 1 : -1);
+    s.switches[8] = static_cast<int8_t>((g_buttons & kBtnR3) ? 1 : -1);
+    s.switches[9] = g_c4;
+
+    s.axesPushes = g_axesPushes.load(std::memory_order_relaxed);
+    s.accepted = g_accepted.load(std::memory_order_relaxed);
+    s.seenButtons = g_seenButtons;
+
+    std::lock_guard<std::mutex> lock(g_statusMutex);
+    g_status = s;
+}
+
+/**
+ * A snapshot of what was last pushed to the firmware.
+ *
+ * Fills `out` with 24 values: four sticks, two dials, the 5-way, the flight
+ * mode, the button mask twice (so 64 bits survive a Java long without sign
+ * games), the ten switch positions, and a stamp saying whether anything has
+ * arrived yet.
+ *
+ * Polling rather than a callback: the readout repaints on the UI thread, and a
+ * push per packet at 100 Hz would post 100 updates a second to a view that draws
+ * at 16.
+ *
+ * The values are the firmware's own units, not rcbridge's - the sticks and dials
+ * were converted by toAnalog before being stored - because what is being shown
+ * is what the model will see.
+ */
+void status(jlong* out, int n)
+{
+    if (out == nullptr || n < 24) return;
+
+    StatusSnapshot s;
+    {
+        std::lock_guard<std::mutex> lock(g_statusMutex);
+        s = g_status;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        out[i] = static_cast<jlong>(toAnalog(s.sticks[i]));
+    }
+    for (int i = 0; i < 2; ++i) {
+        out[4 + i] = static_cast<jlong>(toAnalog(s.dials[i]));
+    }
+    out[6] = static_cast<jlong>(s.five);
+    out[7] = static_cast<jlong>(s.fmode);
+    out[8] = static_cast<jlong>(static_cast<int64_t>(s.buttons >> 32));
+    out[9] = static_cast<jlong>(static_cast<int64_t>(s.buttons & 0xFFFFFFFFull));
+    for (int i = 0; i < 10; ++i) {
+        out[10 + i] = static_cast<jlong>(s.switches[i]);
+    }
+    out[20] = static_cast<jlong>(s.axesPushes);
+    out[21] = static_cast<jlong>(s.accepted);
+    out[22] = s.seenButtons ? 1 : 0;
+    out[23] = (g_running.load(std::memory_order_relaxed) && g_enabled.load(std::memory_order_relaxed)) ? 1 : 0;
 }
 
 void stats(uint64_t* received, uint64_t* accepted, uint64_t* bad, bool* enabled, uint16_t* port)
@@ -659,8 +843,8 @@ void stats(uint64_t* received, uint64_t* accepted, uint64_t* bad, bool* enabled,
 // --------------------------------------------------------------------- JNI --
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_edgetx_droidui_RcBridgeClient_nativeStart(JNIEnv*, jclass, jboolean enabled, jint port,
-                                                    jint sysid, jint compid)
+Java_com_edgetx_droidui_RcBridgeClient_nativeStart(JNIEnv*, jclass, jboolean enabled,
+                                                    jint port, jint sysid, jint compid)
 {
     rc_bridge::configure(enabled == JNI_TRUE, static_cast<uint16_t>(port),
                          static_cast<uint8_t>(sysid), static_cast<uint8_t>(compid));
@@ -688,5 +872,15 @@ Java_com_edgetx_droidui_RcBridgeClient_nativeStats(JNIEnv* env, jclass)
     };
     jlongArray out = env->NewLongArray(5);
     if (out != nullptr) env->SetLongArrayRegion(out, 0, 5, values);
+    return out;
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_edgetx_droidui_RcBridgeClient_nativeStatus(JNIEnv* env, jclass)
+{
+    jlong values[24] = {0};
+    rc_bridge::status(values, 24);
+    jlongArray out = env->NewLongArray(24);
+    if (out != nullptr) env->SetLongArrayRegion(out, 0, 24, values);
     return out;
 }

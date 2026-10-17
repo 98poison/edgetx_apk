@@ -60,6 +60,64 @@ public class EdgeTxApplication extends Application {
             return;
         }
 
+        // The MSDK collector starts here, before the "manually closed" check below.
+        //
+        // It was after it, which is wrong: that check is about the *firmware* link
+        // - whether the EdgeTX simulation and the RF module should be running. The
+        // collector is independent of all of that; it reads the remote's buttons
+        // and sends them to rcbridge over UDP. Hiding it behind a flag that means
+        // something else made the buttons quietly stop working the moment anything
+        // set that flag, with nothing in the log to say why.
+        //
+        // Nothing is opened here: RcBridge.startSdk() joins the registration that
+        // DjiMsdkBridge.init has already started, and the UDP socket only opens
+        // when a stored target exists and Start was pressed. So this costs one
+        // idle object on a launch that never touches a button.
+        try {
+            com.edgetx.droidui.Collector.attachContext(this);
+            com.edgetx.droidui.Collector.startup();
+        } catch (Throwable t) {
+            Log.w(TAG, "collector: could not start at launch", t);
+        }
+
+
+
+        // Read before anything asks for the USB joystick, because the stored answer
+        // decides whether it is claimed at all.
+        com.edgetx.droidui.RcRawJoystick.loadEnabled(this);
+
+        // rcbridge, started here rather than by hand over adb.
+        //
+        // It is the one thing that can read /dev/input - this app has no input
+        // group - and Shizuku can start it as the shell user, which does. So the
+        // app carries its own reader rather than depending on someone remembering
+        // an adb command after every reboot.
+        //
+        // Posted, not inline: it copies 6 MB out of the APK on the first run and
+        // must not sit in front of start-up.
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    com.edgetx.droidui.RcBridgeLauncher.ensureRunning(EdgeTxApplication.this);
+                } catch (Throwable t) {
+                    Log.w(TAG, "launcher: rcbridge could not be started", t);
+                }
+            }
+        });
+
+        // The entry icon used to be shown from here, so that the bridge's screen
+        // could be opened from wherever the user happened to be, over another app
+        // included. It is not any more: the way in is the button in the firmware's
+        // own window (see EdgeTxActivity.addBridgeButton), which needs no overlay
+        // permission and is part of the app rather than a window floating over it,
+        // and the C1/C2/C3 double-tap opens the same page. The icon is still
+        // written and can be brought back by calling BridgeBadge.show() here.
+        //
+        // Nothing else about the app depended on it: the switch for the channel
+        // window is on the settings page, and that window is the only overlay the
+        // app puts up by itself.
+
         if (isManuallyClosed(this)) {
             Log.i(TAG, "link: previously closed by the user; waiting for a manual app launch");
             return;
@@ -132,24 +190,29 @@ public class EdgeTxApplication extends Application {
             Log.i(TAG, "dji: sdk bridge inactive (" + t.getClass().getSimpleName() + ")");
         }
 
-        // The RC's sticks and dials, read straight off the joystick's USB interface: the
-        // DJI SDK publishes them at 8-14 Hz while the device itself produces a new
-        // position every 2.5 ms. The SDK stays as the fallback, see RcRawJoystick.
-        RcRawJoystick.start(this);
-
-        // The same shoulder buttons again, from the kernel's input node through Shizuku:
-        // that is the copy that keeps arriving when the UI is gone. Android stays the
-        // source while a window exists; the native side drops the duplicate (see
-        // joystick.cpp: noteNodeEdge).
-        RcShellKeys.start(this);
-
-        // The sticks, the dials, the five-way and the return button, from the kernel's own
-        // joystick node - the other node Shizuku can reach. It publishes about 50 reports
-        // per second against the SDK's 8-14, and unlike the USB reader it does not detach
-        // the kernel's driver, so the RC's own service and any other reader of the same
-        // device keep working. RcShellSticks has the three routes and their measurements;
-        // the SDK and the USB reader stay as the fallback.
-        RcShellSticks.start(this);
+        // ------------------------------------------------------------ input readers ---
+        //
+        // One reader, not four. rcbridge reads every node in /dev/input as the
+        // shell user (RcBridgeLauncher), so the sticks, the dials, the 5-way, the
+        // return button, the six shoulder buttons and the two camera buttons all
+        // arrive over UDP from one place. What the app does NOT do is read them a
+        // second time by a second route, which is what these three were:
+        //
+        //   RcRawJoystick   the USB joystick interface, 398 reports/s. Good, but
+        //                    claiming it makes the kernel node disappear from
+        //                    /proc/bus/input/devices for everything else on the
+        //                    radio, and it did not come back when the app was
+        //                    killed. Off by default; the settings page can turn it
+        //                    on for anyone who prefers it.
+        //   RcShellSticks   the same /dev/input node rcbridge is already reading.
+        //   RcShellKeys     the same /dev/input node again, for six keys.
+        //
+        // Two processes holding one evdev node is legal on Linux, but "legal" is
+        // not "harmless": the node disappears from the device list on this remote
+        // while anything has it, and the measurements were unambiguous - two
+        // minutes stable with only rcbridge, gone twenty seconds after a second
+        // reader started.
+        RcRawJoystick.start(this);   // no-op unless the setting is on
 
         // The buttons the remote's own handler logs, which on the RC Pro is the reliable
         // source for the pause, landing and custom buttons. Inert without READ_LOGS, see

@@ -2,6 +2,9 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
+    // No org.jetbrains.kotlin.android here: AGP 9 compiles RcBridge.kt and
+    // Proto.kt itself, and applying the standalone plugin on top makes it fail
+    // with "Cannot add extension with name 'kotlin'". See the root script.
 }
 
 // ---------------------------------------------------------------------------
@@ -65,20 +68,33 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        // The original install identity. This build takes the com.edgetx.droidui
-        // slot itself: the ".bridge" suffix only ever existed so it could sit next
-        // to a previous EdgeTX install, and that name is now used by a different
-        // test app on the radio.
+        // The shipping app. Two packages exist because DJI issues an App Key against
+        // one package name AND one signing certificate, and SDKManager.registerApp()
+        // checks both at runtime against what is actually installed:
         //
-        // The signing certificate is the committed release keystore
-        // (signing/release.keystore), so installing over an older build of this
-        // same project updates in place; a build signed with any other key fails
-        // with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+        //     com.edgetx.droidui        App Key 2e5a3e9dd2692902dfdf4dd1   this one
+        //     com.edgetx.droidui.bridge App Key d652e49f1199550a57cc0e52   the test app
+        //
+        // The second is built from this same tree with dji.appKey changed and is used
+        // for trying things without disturbing the installed one; it is not what the
+        // CI build produces (see .github/workflows/build-apk.yml, which passes the
+        // shipping key as dji.appKey).
+        //
+        // Getting either wrong makes every DJI key go quiet - go-home, pause, C1..C4,
+        // the flight-mode switch - and the failure is silent. DjiMsdkBridge
+        // .logAppIdentity() prints the package and the certificate SHA1 at every
+        // launch, which is the line to compare against developer.dji.com.
+        //
+        // This tree builds the shipping app. If it is being used for the .bridge
+        // test package instead, change this line AND local.properties' dji.appKey
+        // together (com.edgetx.droidui.bridge / d652e49f1199550a57cc0e52) - never
+        // one without the other, and change them back before pushing, because the
+        // CI overrides dji.appKey but not this line.
         applicationId = "com.edgetx.droidui"
         minSdk = 24
         targetSdk = 33
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
 
         // The DJI Mobile SDK reads its App Key from this manifest meta-data
         // (SDKManager.registerApp() takes no argument). Empty when MSDK is unused.
@@ -140,14 +156,36 @@ android {
     }
 
     androidResources {
-        // aapt2's own ignore-assets list, by name. Three data sets the SDK ships and
-        // this app never reads: the no-fly-zone databases (flysafe/, 11.8 MB), the
-        // geoid height tables (geoid_data/, 3.3 MB) and the SDK's ac.zip (4.7 MB).
-        // None of them is touched during init, registerApp() or by the Key-Value API -
-        // verified on the RC by removing them and watching the SDK come up and every
-        // input arrive. assets/ProductCapability/ is deliberately kept: it is 80 KB
-        // and the SDK does read it to find out what the connected product supports.
-        ignoreAssetsPatterns += listOf("flysafe", "geoid_data", "ac.zip")
+        // rcbridge is staged out of assets on first run (RcBridgeLauncher), which
+        // reads it as a stream and writes it through a shell process. Stored
+        // uncompressed so that is a copy rather than an inflate on the radio's
+        // CPU, and so the binary is byte-identical to the one built alongside.
+        noCompress += "rcbridge-linux-arm64"
+        // aapt2's own ignore-assets list, by name.
+        //
+        // flysafe/ is NOT here, and that is a correction rather than an
+        // optimisation. It used to be, together with ac.zip and geoid_data/, on
+        // the grounds that registration does not read them - verified on the RC by
+        // removing all three and watching the SDK come up with every stick and
+        // dial reporting. That verification was sound and still reached the wrong
+        // conclusion: what failed was not visible in the data being read.
+        //
+        // SDKManager.initMSDKDevices() calls FlyforbidUtils.copyDatabaseFromAsset()
+        // for flysafe/dji.nfzdb2.confumix, and when the asset is absent that throws
+        // FileNotFoundException inside registerApp(). Registration does not fail
+        // once - it never finishes, because initMSDKDevices() re-enters
+        // doRegisterApp() and the whole cycle repeats at ~1 kHz forever, visible
+        // only as a wall of identical System.err frames.
+        //
+        // The stick, dial and 5-way listeners are installed on a different path
+        // that registration does not gate, which is exactly why the axes kept
+        // arriving and this read as working. The 18 key listeners are installed by
+        // the registration callback, so every button on the remote - shutter,
+        // record, pause, go-home, C1..C4 - silently never registered, with no error
+        // anywhere to connect the missing buttons to a missing database.
+        //
+        // 11.8 MB for the entire button set is the right trade.
+        ignoreAssetsPatterns += listOf("geoid_data")
 
         // The SDK's resource table is 18 MB, most of it the same strings in ~80
         // languages for a UI this app never shows. Keep the two that could ever be
@@ -408,6 +446,10 @@ if (skipEdgeTxBuild) {
 // only packaged when dji.msdk=true.
 // ---------------------------------------------------------------------------
 dependencies {
+    // RcBridge.kt / Proto.kt are Kotlin; the Android plugin adds the stdlib
+    // matching its own compiler automatically, this just makes it explicit.
+    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.10")
+
     compileOnly("com.dji:dji-sdk-v5-aircraft-provided:$djiMsdkVersion")
 
     // RF module on a USB serial port. Supports CDC-ACM and the usual

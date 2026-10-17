@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext HTTP, permitted to the loopback address only.
+
+  rcbridge serves its channel table on http://127.0.0.1:8080/api/routes, and the
+  app reads that to draw the readout. From Android 9 a plain-HTTP request is
+  refused unless the app opts in, and targetSdk 33 takes the strict default - so
+  the page showed "读不到 rcbridge / 连不上 http://127.0.0.1:8080/api/routes"
+  while `adb shell curl` on the same address worked fine. The two readers were
+  not disagreeing about the network: one of them was being blocked before it
+  reached the socket.
+
+  Scoped to loopback rather than android:usesCleartextTraffic="true" on purpose.
+  rcbridge only ever listens on this device, and a blanket opt-in would also
+  allow plain HTTP to the DJI SDK's endpoints and to any MAVLink/CRSF target the
+  user configures, which are addresses this app has no business sending
+  unauthenticated traffic to.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

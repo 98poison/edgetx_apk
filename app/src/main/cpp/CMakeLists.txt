@@ -27,6 +27,7 @@ add_library(edgetx_ui SHARED
     audio.cpp
     module_serial.cpp
     net_link.cpp
+    channels.cpp
     rc_bridge.cpp
     ${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c
 )

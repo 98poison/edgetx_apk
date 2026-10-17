@@ -51,8 +51,14 @@ enum Stream {
 // `host` may be an IPv4 literal or a name (it is resolved once, in init()).
 // `mode` is a bitmask of Stream values. `rateHz` is how often the JSON snapshot
 // is emitted (1..200); events are sent as they happen, regardless of the rate.
+//
+// `echo` asks the host to bounce a probe back (see roundTrip()): a "PROBE <seq>
+// <ms>" datagram goes out twice a second and whatever comes back on the same
+// socket is matched against it. It needs a host that echoes - tools/echo-udp.ps1
+// in the repository does - and is off by default, because it is the only thing
+// here that reads from the socket rather than only writing to it.
 void configure(bool enabled, const char* host, uint16_t port, uint16_t crsfPort, int mode,
-               int rateHz);
+               int rateHz, bool echo);
 
 // Starts the sender thread. Idempotent. Does nothing when the configuration
 // has the link disabled.
@@ -92,5 +98,25 @@ void onModuleTx(const uint8_t* data, uint32_t len);
 // periodic log line.
 void stats(uint32_t* sentFrames, uint32_t* droppedFrames, uint32_t* sentBytes, bool* enabled,
            int* mode);
+
+// Send-side latency, in microseconds, as the settings page wants it. Ten values:
+//
+//   [0..2] the module (channel) stream: p50, p95, max
+//   [3..5] the control (JSON) stream:   p50, p95, max
+//   [6..8] sendto() itself:             p50, p95, max
+//   [9]    samples behind [0..2], so a fresh link is not read as "0 us"
+//
+// "the module stream" is measured from the moment the firmware handed the driver
+// its bytes (onModuleTx) to the moment sendto() returned, so it is the whole
+// device-side hop for the 16 mixed channels. The control stream is measured from
+// the stick/dial change the snapshot carries. Air time and the host are on top.
+void latency(uint32_t* out10);
+
+// Round-trip time to the host, in microseconds, from the echo probe. Needs
+// `echo` in configure() and something on the host that bounces the probe back.
+// `replies` is how many probes have come back, so a zero can be told from "the
+// host is not echoing".
+void roundTrip(uint32_t* last, uint32_t* minimum, uint32_t* average, uint32_t* maximum,
+               uint32_t* replies);
 
 }  // namespace net_link

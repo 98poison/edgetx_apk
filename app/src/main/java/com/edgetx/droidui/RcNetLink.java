@@ -38,6 +38,7 @@ import java.nio.charset.StandardCharsets;
  *   crsf_port = 14561          the module stream (raw module-protocol bytes)
  *   mode      = json,crsf      which streams to send: json, crsf, both, or a bitmask
  *   rate      = 50             control snapshots per second, 1..200
+ *   echo      = false          ask the host to bounce a probe back, for the round-trip time
  * </pre>
  *
  * <p>The two streams are independent and can be combined:
@@ -165,7 +166,8 @@ final class RcNetLink {
                 .append("port=").append(config.port).append('\n')
                 .append("crsf_port=").append(config.crsfPort).append('\n')
                 .append("mode=").append(mode).append('\n')
-                .append("rate=").append(config.rate).append('\n');
+                .append("rate=").append(config.rate).append('\n')
+                .append("echo=").append(config.echo).append('\n');
         try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
             out.write(text.toString().getBytes(StandardCharsets.UTF_8));
         }
@@ -187,16 +189,17 @@ final class RcNetLink {
             } else {
                 Log.w(TAG, "net: " + CONFIG + " selects no stream, the network output stays off");
             }
-            if (live) nativeReconfigure(false, "", config.port, config.crsfPort, 0, config.rate);
+            if (live) nativeReconfigure(false, "", config.port, config.crsfPort, 0, config.rate,
+                    config.echo);
             return;
         }
 
         if (live) {
             nativeReconfigure(true, config.host, config.port, config.crsfPort, config.mode,
-                    config.rate);
+                    config.rate, config.echo);
         } else {
             nativeConfigure(true, config.host, config.port, config.crsfPort, config.mode,
-                    config.rate);
+                    config.rate, config.echo);
         }
 
         Log.i(TAG, "net: " + describe(config) + " -> " + config.host + " (controls :"
@@ -207,6 +210,42 @@ final class RcNetLink {
     /** { sentFrames, droppedFrames, sentBytes, enabled, mode } - for a status log. */
     static int[] stats() {
         return nativeStats();
+    }
+
+    /**
+     * How long the datagrams take to get out, in microseconds. Ten values:
+     *
+     * <pre>
+     *   [0..2]  the module (channel) stream: p50, p95, max
+     *   [3..5]  the control (JSON) stream:   p50, p95, max
+     *   [6..8]  sendto() itself:             p50, p95, max
+     *   [9]     samples behind [0..2]
+     * </pre>
+     *
+     * <p>The module figure is measured from the moment the firmware handed its driver the bytes
+     * of a frame - i.e. from the mixer producing the 16 channels - to the moment {@code sendto()}
+     * returned. That is the part of the trip this radio is responsible for; air time, whatever is
+     * in between and the host are on top of it, and {@link #roundTrip()} is what measures those.
+     */
+    static int[] latency() {
+        try {
+            return nativeLatency();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * The round trip to the host, in microseconds, from the echo probe: { last, minimum,
+     * average, maximum, replies }. Empty until the host echoes - see {@code echo} above and
+     * {@code tools/echo-udp.ps1} in the repository.
+     */
+    static int[] roundTrip() {
+        try {
+            return nativeRoundTrip();
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private static String describe(Config config) {
@@ -248,6 +287,9 @@ final class RcNetLink {
                     break;
                 case "rate":
                     config.rate = parseRate(value);
+                    break;
+                case "echo":
+                    config.echo = parseBoolean(value);
                     break;
                 default:
                     Log.w(TAG, "net: " + CONFIG + ":" + number + ": unknown key \"" + key + "\"");
@@ -336,18 +378,23 @@ final class RcNetLink {
         int crsfPort = DEFAULT_CRSF_PORT;
         int mode = STREAM_JSON | STREAM_CRSF;
         int rate = DEFAULT_RATE;
+        boolean echo = false;
     }
 
     // Configured from Java, owned by net_link.cpp. See net_link.h.
     private static native void nativeConfigure(boolean enabled, String host, int port,
-            int crsfPort, int mode, int rateHz);
+            int crsfPort, int mode, int rateHz, boolean echo);
 
     /**
      * Same, but for a link that is already running: net_link::stop() + configure() + init(),
      * which is what a changed host or port needs (the destination is resolved once, in init()).
      */
     private static native void nativeReconfigure(boolean enabled, String host, int port,
-            int crsfPort, int mode, int rateHz);
+            int crsfPort, int mode, int rateHz, boolean echo);
 
     private static native int[] nativeStats();
+
+    private static native int[] nativeLatency();
+
+    private static native int[] nativeRoundTrip();
 }

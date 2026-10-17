@@ -3,4 +3,13 @@
     <!-- Sampled from the EdgeTX logo's dark shield so the adaptive-icon
          background blends with the artwork inside the mask. -->
     <color name="ic_launcher_background">#14171c</color>
+    <!-- The bridge app's launcher name.
+
+         The icon is the stock EdgeTX one, deliberately: it is the app's own
+         artwork and a second picture beside it on the same launcher looked like a
+         different program. The two apps are told apart by this string instead,
+         which is why it is "EdgeTX bridge" with a lower-case b rather than
+         "EdgeTX Bridge" - at icon size the two differ by a letter's width, and
+         the stock app's label is a plain "EdgeTX". -->
+    <string name="app_name">EdgeTX bridge</string>
 </resources>

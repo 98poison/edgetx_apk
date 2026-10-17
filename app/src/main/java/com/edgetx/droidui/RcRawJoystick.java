@@ -163,6 +163,65 @@ final class RcRawJoystick {
      */
     private static volatile boolean sReaderStarted;
 
+    /**
+     * Whether this reader may claim the USB joystick at all.
+     *
+     * <p>Default on, because it is the better path: 398 reports a second straight
+     * off the device, every report on every control, and it cannot lose the node
+     * because it never touches one.
+     *
+     * <p>But claiming it is not free. On this remote the kernel node
+     * "DJI embedded joystick" - which is what rcbridge reads, and what carries the
+     * sticks for anything reading /dev/input - disappears from
+     * /proc/bus/input/devices once this reader has the USB interface. Measured
+     * over one session: it survived two minutes with only rcbridge running, was
+     * gone twenty seconds after this app started, and did not come back when the
+     * app was killed.
+     *
+     * <p>So when another program on the remote needs that node, this stands down
+     * and the sticks come from wherever that program puts them. Off means the USB
+     * interface is released, which is the whole point - it is not "ignore what
+     * the reader reports", it is "stop holding the device".
+     */
+    private static volatile boolean sEnabled = false;
+
+    private static final String PREF_RAW = "rawjoystick";
+    private static final String PREF_RAW_ENABLED = "enabled";
+
+    /** Whether the USB reader is allowed to claim the device. */
+    static boolean isEnabled() {
+        return sEnabled;
+    }
+
+    /**
+     * Turns the USB reader on or off.
+     *
+     * <p>Turning it off only takes effect on the next {@link #start}: the reader is
+     * a blocked {@code bulkTransfer} on a thread with no cancellation point, and
+     * interrupting it would leave the interface claimed anyway - which is the
+     * state this is trying to leave.
+     *
+     * <p>So this says so rather than pretending otherwise, and the caller is
+     * expected to restart the app for it to take full effect.
+     */
+    static void setEnabled(Context context, boolean enabled) {
+        sEnabled = enabled;
+        if (context != null) {
+            context.getApplicationContext()
+                    .getSharedPreferences(PREF_RAW, Context.MODE_PRIVATE)
+                    .edit().putBoolean(PREF_RAW_ENABLED, enabled).apply();
+        }
+        Log.i(TAG, "raw joystick: " + (enabled
+                ? "enabled - it will claim the USB device when the app restarts"
+                : "disabled - restart the app for it to release the USB device"));
+    }
+
+    /** Reads the stored choice. Called once, from the Application. */
+    static void loadEnabled(Context context) {
+        sEnabled = context.getSharedPreferences(PREF_RAW, Context.MODE_PRIVATE)
+                .getBoolean(PREF_RAW_ENABLED, false);
+    }
+
     /** The permission receiver is registered once, however often {@link #start} is called. */
     private static volatile boolean sReceiverRegistered;
 
@@ -225,6 +284,12 @@ final class RcRawJoystick {
      */
     static void start(Context context) {
         try {
+            if (!sEnabled) {
+                if (sReaderStarted) {
+                    Log.i(TAG, "raw joystick: disabled by the setting, standing down");
+                }
+                return;
+            }
             sVerbose = new File(context.getExternalFilesDir(null), TRIGGER).isFile();
 
             final UsbManager manager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
