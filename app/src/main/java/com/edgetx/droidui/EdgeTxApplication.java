@@ -143,6 +143,14 @@ public class EdgeTxApplication extends Application {
         // joystick.cpp: noteNodeEdge).
         RcShellKeys.start(this);
 
+        // The sticks, the dials, the five-way and the return button, from the kernel's own
+        // joystick node - the other node Shizuku can reach. It publishes about 50 reports
+        // per second against the SDK's 8-14, and unlike the USB reader it does not detach
+        // the kernel's driver, so the RC's own service and any other reader of the same
+        // device keep working. RcShellSticks has the three routes and their measurements;
+        // the SDK and the USB reader stay as the fallback.
+        RcShellSticks.start(this);
+
         // The buttons the remote's own handler logs, which on the RC Pro is the reliable
         // source for the pause, landing and custom buttons. Inert without READ_LOGS, see
         // RcDpadLog - the SDK paths then behave exactly as they did before.

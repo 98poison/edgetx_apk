@@ -314,6 +314,11 @@ final class RcShellKeys {
                 | (bytes[at + 3] << 24);
     }
 
-    /** joystick.cpp: the same handler Android's key events go through. */
-    private static native void nativeOnNodeKey(int keycode, boolean down);
+    /**
+     * joystick.cpp: the same handler Android's key events go through, and the one that drops a
+     * second copy of the same press (see {@code noteNodeEdge}). Package-private because
+     * RcShellSticks feeds the joystick node's own two keys - the return button and the
+     * five-way's centre press - through the same path.
+     */
+    static native void nativeOnNodeKey(int keycode, boolean down);
 }

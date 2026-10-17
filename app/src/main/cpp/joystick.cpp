@@ -698,7 +698,93 @@ bool present() { return g_present; }
 // ---------------------------------------------------------------------------
 std::mutex g_firmwareMutex;
 
+// ---------------------------------------------------------------------------
+// Key gate: nothing may press a key before the firmware itself is up.
+//
+// A key press makes EdgeTX build the page that key leads to, and until the boot
+// has loaded the model there is no layout to build into. On the RC Plus 2 a key
+// that arrives while the splash is still up kills the process inside
+// ScreenSetupPage::build() -> LayoutChoice::LayoutChoice, a null dereference
+// (SIGSEGV / SEGV_MAPERR, fault addr 0x0) raised from lv_indev_read_timer_cb.
+// It is not survivable and it repeats on every start, which is exactly what the
+// inbound bridge caused: it holds L1/L2/L3 down from the moment it comes up,
+// those become SYS/MODEL/TELE, and the radio crashed some two seconds into
+// every launch.
+//
+// The gate is simu::firmwareRunning(), the simulator library's own
+// simuIsRunning(). It is the same signal simu_host.cpp:requestFullRefresh()
+// trusts before touching LVGL, and for the same reason: it answers true only
+// once the firmware is up, whereas the link's own flag only means "this app is
+// not sure". Switches and analog values are deliberately *not* held back -
+// EdgeTX reads the switch positions as part of its startup checks, which is why
+// joystick::restoreSwitches() runs before simuStart().
+//
+// simuIsRunning() is a weak symbol (simu_host.h), so a library without it would
+// answer false forever and the keys would never arrive at all. The gate
+// therefore gives up after kKeyGateGivingUpMs and lets them through with a
+// warning: a strange library must leave the controls usable, not dead.
+constexpr auto kKeyGateGivingUpMs = std::chrono::milliseconds(20000);
+
+std::mutex g_keyGateMutex;
+bool g_keyGateOpen = false;
+bool g_keyGateWarned = false;
+std::chrono::steady_clock::time_point g_keyGateSince{};
+
+bool key_gate_open() {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_keyGateMutex);
+    if (g_keyGateSince.time_since_epoch().count() == 0) g_keyGateSince = now;
+
+    if (simu::firmwareRunning()) {
+        if (!g_keyGateOpen) {
+            g_keyGateOpen = true;
+            LOGI("joystick: firmware up, keys enabled (%d ms after the first key arrived)",
+                 (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - g_keyGateSince)
+                     .count());
+        }
+        return true;
+    }
+
+    // Not up yet, or not up again: the firmware thread is restarted for a model
+    // change and for every return to the foreground, and the same page build is
+    // just as unsafe then. Re-closing the gate costs one dropped key at worst.
+    if (g_keyGateOpen) {
+        g_keyGateOpen = false;
+        LOGI("joystick: firmware went away, keys held back until it is up again");
+    }
+    if (now - g_keyGateSince >= kKeyGateGivingUpMs) {
+        if (!g_keyGateWarned) {
+            g_keyGateWarned = true;
+            LOGW("joystick: the firmware has not reported itself up after %d ms - letting keys "
+                 "through anyway",
+                 (int)std::chrono::duration_cast<std::chrono::milliseconds>(kKeyGateGivingUpMs)
+                     .count());
+        }
+        return true;
+    }
+    return false;
+}
+
+// One line per key, so the log shows which button was pressed into the boot
+// without letting a stuck button flood logcat at the rate the link thread runs.
+std::vector<uint8_t> g_loggedEarlyKeys;
+
+void log_early_key_once(uint8_t key, bool down) {
+    if (std::find(g_loggedEarlyKeys.begin(), g_loggedEarlyKeys.end(), key) !=
+        g_loggedEarlyKeys.end()) {
+        return;
+    }
+    g_loggedEarlyKeys.push_back(key);
+    LOGI("joystick: %s %s dropped, the firmware is still booting", etkey_name(key),
+         down ? "down" : "up");
+}
+
 void set_key(uint8_t key, bool down) {
+    if (!key_gate_open()) {
+        log_early_key_once(key, down);
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(g_firmwareMutex);
     simu::setKey(key, down);
 

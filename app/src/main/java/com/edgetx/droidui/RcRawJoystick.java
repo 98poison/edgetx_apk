@@ -92,6 +92,14 @@ final class RcRawJoystick {
     /** Verbose logging is on only while this file exists. */
     private static final String TRIGGER = "hid_probe";
 
+    /**
+     * How long the reader waits for the kernel node's reader ({@link RcShellSticks}) to say
+     * whether it is taking the axes, before it takes the interface itself. Long enough for a
+     * Shizuku that is still starting, and it costs nothing on a radio without Shizuku: that
+     * answer comes back immediately.
+     */
+    private static final long WAIT_FOR_NODE_MS = 8000;
+
     private static final int AXIS_COUNT = 6;
     private static final int AXIS_FIRST = 4;
     private static final int AXIS_CENTRE = 1024;
@@ -297,13 +305,28 @@ final class RcRawJoystick {
     }
 
     /**
-     * Whether this reader is feeding the firmware at the moment - the sticks, the dials, the
-     * 5-way and the record button. While it is, the SDK's own copies of those are only
-     * older, and for the 5-way they would be a second press of the same button; everything
-     * the reports do not carry still comes from the SDK.
+     * Whether the sticks, the dials, the 5-way and the record button are being fed from
+     * somewhere other than the SDK at the moment. True while this reader is feeding them, and
+     * true while {@link RcShellSticks} is reading the kernel's joystick node instead - either
+     * way the SDK's own copies of those are only older, and for the 5-way they would be a
+     * second press of the same button; everything the two readers do not carry still comes
+     * from the SDK.
      */
     static boolean ownsInputs() {
-        return sOwned;
+        return sOwned || RcShellSticks.ownsInputs();
+    }
+
+    /** Whether the verbose log is on - {@link RcShellSticks} shares this switch. */
+    static boolean verbose() {
+        return sVerbose;
+    }
+
+    /** One axis as the SDK last reported it, for the node reader's comparison line. */
+    static int sdkValue(int index) {
+        if (index < 0 || index >= AXIS_COUNT) {
+            return 0;
+        }
+        return sSdkValue[index];
     }
 
     /** One stick value from the SDK: recorded, and compared in the verbose log. */
@@ -355,6 +378,20 @@ final class RcRawJoystick {
         }
 
         final UsbInterface iface = device.getInterface(0);
+
+        // The kernel's joystick node is a second route to these same axes and the cheaper one
+        // for everything else: a forced claim detaches the driver behind it, which leaves the
+        // node in place but silent (measured: 0 events in 25 s while the app held the
+        // interface) and takes the device away from the RC's own service and from anything else
+        // reading it. So while RcShellSticks can read the node, the interface stays with the
+        // kernel and the sticks come from there.
+        if (RcShellSticks.takesOverAxes(WAIT_FOR_NODE_MS)) {
+            Log.i(TAG, "raw joystick: the kernel's joystick node is being read "
+                    + "(RcShellSticks), leaving the USB interface alone");
+            connection.close();
+            return;
+        }
+
         // force = true detaches the kernel's own driver, which is the point: it is what
         // lets an app see the reports. The driver comes back when this connection closes.
         if (!connection.claimInterface(iface, true)) {

@@ -65,7 +65,25 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        applicationId = "com.edgetx.droidui"
+        // Installed alongside the radio's own EdgeTX rather than over it.
+        //
+        // This build is signed with a different key - the signing keystore the
+        // release uses lives in signing/release.keystore, which is not in this
+        // checkout - so installing over the existing app fails with
+        // INSTALL_FAILED_UPDATE_INCOMPATIBLE, and the only way through that is to
+        // uninstall the original first. That is not a trade worth making for a
+        // build that adds a network input: the radio already works, it already
+        // has EdgeTX, and uninstalling costs its settings.
+        //
+        // A different applicationId is enough for both to be installed at once,
+        // which is the more useful arrangement anyway - the two can be compared,
+        // and the stock one is still there if this build misbehaves.
+        //
+        // The *namespace* stays com.edgetx.droidui on purpose: that is the code's
+        // package, and the JNI entry points are named after it
+        // (Java_com_edgetx_droidui_RcBridgeClient_*). Only the install identity
+        // differs, so nothing in the sources has to move.
+        applicationId = "com.edgetx.droidui.bridge"
         minSdk = 24
         targetSdk = 33
         versionCode = 1
