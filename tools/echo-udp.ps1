@@ -14,28 +14,32 @@
 
     Only datagrams that start with PROBE are echoed. Everything else the app
     sends - the JSON control snapshots - is counted and dropped, which keeps a
-    50 Hz control stream from being thrown back at the radio for no reason.
+    50-100 Hz control stream from being thrown back at the radio for no reason.
 
-    Turn it on in the app first: settings page (the gear button on the firmware's
-    screen) -> 回声测距. Without that the app never sends a probe and this script
-    has nothing to do.
+    Turn it on in the app first: the settings button on the firmware's screen
+    opens the page, and there "echo ranging" (回声测距) is the checkbox. Without
+    it the app never sends a probe and this script has nothing to do.
 
 .PARAMETER Port
-    The port to listen on. Must be the app's 控制端口 (JSON), NOT the module port:
-    default 14560, and the app's own default.
+    The port to listen on. Must be the app's control port (JSON), NOT the module
+    port: default 14560, which is also the app's own default.
 
 .PARAMETER Seconds
     Stop after this many seconds. 0 (the default) runs until Ctrl-C.
 
 .EXAMPLE
-    .\tools\echo-udp.ps1
-    .\tools\echo-udp.ps1 -Port 14560 -Seconds 60
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools\echo-udp.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools\echo-udp.ps1 -Seconds 60
 
 .NOTES
     Windows Firewall asks the first time. Allow it for private networks, or the
     packets from the radio are dropped before they reach this process - the
-    symptom is an app that says "往返: 没有回包" while the control stream is
-    visibly arriving in tools\netdump.ps1.
+    symptom is an app that says "no reply" while the control stream is visibly
+    arriving in tools\netdump.ps1.
+
+    English only on purpose: a .ps1 with non-ASCII text is read with the legacy
+    codepage by Windows PowerShell unless it carries a UTF-8 BOM, and the parser
+    then fails on the mangled bytes.
 #>
 param(
     [int]$Port = 14560,
@@ -48,20 +52,21 @@ $ErrorActionPreference = "Stop"
 $endpoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Bind), $Port)
 $socket = [System.Net.Sockets.UdpClient]::new($endpoint)
 
-Write-Host "echo-udp: listening on $Bind`:$Port (UDP) - Ctrl-C to stop"
-Write-Host "echo-udp: the app must have 回声测距 on, and the same port as 控制端口"
+Write-Host "echo-udp: listening on ${Bind}:$Port (UDP) - Ctrl-C to stop"
+Write-Host "echo-udp: the app needs echo ranging on, on the same port as its control stream"
 
 $received = 0
 $probes = 0
 $bytes = 0
 $lastReport = [DateTime]::UtcNow
-$stopAt = if ($Seconds -gt 0) { [DateTime]::UtcNow.AddSeconds($Seconds) } else { [DateTime]::MaxValue }
+if ($Seconds -gt 0) { $stopAt = [DateTime]::UtcNow.AddSeconds($Seconds) } else { $stopAt = [DateTime]::MaxValue }
 
 try {
     while ([DateTime]::UtcNow -lt $stopAt) {
         # A receive timeout rather than a blocking read, so the deadline and the
         # periodic report are honoured without a second thread.
         $socket.Client.ReceiveTimeout = 500
+        $data = $null
         try {
             $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
             $data = $socket.Receive([ref]$remote)
@@ -71,7 +76,6 @@ try {
             if ($_.Exception.SocketErrorCode -ne [System.Net.Sockets.SocketError]::TimedOut) {
                 throw
             }
-            $data = $null
         }
 
         if ($null -ne $data -and $data.Length -gt 0) {
@@ -79,7 +83,7 @@ try {
             $bytes += $data.Length
 
             # "PROBE " is six bytes; compare them without turning the payload into
-            # a string, because the JSON snapshots are not text-safe to decode on
+            # a string, because the JSON snapshots are not something to decode on
             # every packet.
             $isProbe = $data.Length -gt 6 -and
                 $data[0] -eq 0x50 -and $data[1] -eq 0x52 -and $data[2] -eq 0x4F -and
@@ -97,13 +101,11 @@ try {
 
         $now = [DateTime]::UtcNow
         if (($now - $lastReport).TotalSeconds -ge 1) {
-            Write-Host ("echo-udp: {0} 包 / {1} KB, 回弹 {2} 个探针" -f `
-                $received, [math]::Round($bytes / 1024, 1), $probes)
+            Write-Host ("echo-udp: {0} packets / {1} KB, {2} probes echoed" -f $received, [math]::Round($bytes / 1024, 1), $probes)
             $lastReport = $now
         }
     }
 } finally {
     $socket.Close()
-    Write-Host ("echo-udp: stopped. {0} 包 / {1} KB, 回弹 {2} 个探针" -f `
-        $received, [math]::Round($bytes / 1024, 1), $probes)
+    Write-Host ("echo-udp: stopped. {0} packets / {1} KB, {2} probes echoed" -f $received, [math]::Round($bytes / 1024, 1), $probes)
 }
