@@ -81,7 +81,7 @@
 
     <application
         android:name=".EdgeTxApplication"
-        android:label="EdgeTX Bridge"
+        android:label="EdgeTX"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:allowBackup="false"
